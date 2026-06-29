@@ -1,0 +1,6 @@
+{
+  "name": "PolyTrader",
+  "description": "Simple and clean prediction market trading for Polymarket.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
