@@ -75,9 +75,26 @@ class MainActivity : ComponentActivity() {
   override fun onCreate(savedInstanceState: Bundle?) {
     super.onCreate(savedInstanceState)
     enableEdgeToEdge()
+
+    // Background market intelligence: daily digest + whale watch (read-only).
+    com.example.work.MarketIntel.schedule(applicationContext)
+    if (android.os.Build.VERSION.SDK_INT >= 33 &&
+      checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) !=
+      android.content.pm.PackageManager.PERMISSION_GRANTED
+    ) {
+      requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 100)
+    }
+
+    // A digest/whale notification can deep-link straight into its report.
+    val pendingTitle = intent?.getStringExtra(com.example.work.MarketIntel.EXTRA_REPORT_TITLE)
+    val pendingContent = intent?.getStringExtra(com.example.work.MarketIntel.EXTRA_REPORT_CONTENT)
+
     setContent {
       MyApplicationTheme {
-        MainScreen()
+        MainScreen(
+          pendingReportTitle = pendingTitle,
+          pendingReportContent = pendingContent
+        )
       }
     }
   }
@@ -104,14 +121,27 @@ object QuantTheme {
 }
 
 @Composable
-fun MainScreen() {
+fun MainScreen(
+  pendingReportTitle: String? = null,
+  pendingReportContent: String? = null
+) {
   val context = LocalContext.current
   val viewModel: TradeViewModel = viewModel()
   val uiState by viewModel.uiState.collectAsStateWithLifecycle()
+  val watchedIds by viewModel.watchedIds.collectAsStateWithLifecycle()
+  val watchlist by viewModel.watchlist.collectAsStateWithLifecycle()
+  val savedReports by viewModel.savedReports.collectAsStateWithLifecycle()
 
   var selectedTradeOpportunity by remember { mutableStateOf<TradeOpportunity?>(null) }
   var notificationMessage by remember { mutableStateOf<String?>(null) }
   var showSettingsModal by remember { mutableStateOf(false) }
+
+  // Open a report delivered via notification tap.
+  LaunchedEffect(pendingReportContent) {
+    if (!pendingReportContent.isNullOrBlank()) {
+      viewModel.presentReport(pendingReportTitle ?: "REPORT", pendingReportContent)
+    }
+  }
 
   // Set up the event flow listener for high density toast alerts
   LaunchedEffect(Unit) {
@@ -181,9 +211,40 @@ fun MainScreen() {
           "signals" -> SignalsView(
             uiState = uiState,
             viewModel = viewModel,
+            watchedIds = watchedIds,
             onOpenUrl = { opportunity ->
               selectedTradeOpportunity = opportunity
             }
+          )
+          "watchlist" -> com.example.ui.components.WatchlistView(
+            watchlist = watchlist,
+            reports = savedReports,
+            onOpenMarket = { entity ->
+              selectedTradeOpportunity = TradeOpportunity(
+                id = entity.marketId,
+                title = entity.title,
+                description = "Watchlisted market — live research view.",
+                endsAt = "",
+                url = entity.url,
+                probability = entity.probability,
+                delta = 0.0,
+                confidenceScore = 0.0,
+                confidenceGrade = "—",
+                volume = entity.volume,
+                liquidity = "—",
+                hftSignal = "TRACKED",
+                category = entity.category,
+                tokenId = entity.tokenId,
+                conditionId = entity.conditionId
+              )
+            },
+            onOpenUrl = { url ->
+              val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+              context.startActivity(intent)
+            },
+            onRemove = { viewModel.removeFromWatchlist(it) },
+            onOpenReport = { report -> viewModel.presentReport(report.title.uppercase(), report.content) },
+            onDeleteReport = { viewModel.deleteReport(it) }
           )
           "portfolio" -> PortfolioView(
             uiState = uiState,
@@ -224,15 +285,17 @@ fun MainScreen() {
           context.startActivity(intent)
         },
         onLoadResearch = { op -> viewModel.loadMarketResearch(op) },
-        onSelectRange = { op, range -> viewModel.setResearchRange(op, range) }
+        onSelectRange = { op, range -> viewModel.setResearchRange(op, range) },
+        onCorrelate = { a, b -> viewModel.correlateMarkets(a, b) }
       )
     }
 
-    // Alpha Report deep-scan viewer
+    // Alpha Report / research library viewer
     if (uiState.showAlphaDialog) {
       AlphaReportDialog(
         report = uiState.alphaReport,
         isGenerating = uiState.isAlphaGenerating,
+        title = uiState.alphaReportTitle,
         onDismiss = { viewModel.dismissAlphaDialog() },
         onRegenerate = { viewModel.generateAlphaReport() }
       )
@@ -422,6 +485,12 @@ fun BottomNavBar(
       icon = Icons.Default.Bolt,
       isActive = activeTab == "signals",
       onClick = { onTabSelected("signals") }
+    )
+    NavBarItem(
+      label = "Watchlist",
+      icon = Icons.Default.Star,
+      isActive = activeTab == "watchlist",
+      onClick = { onTabSelected("watchlist") }
     )
     NavBarItem(
       label = "Portfolio",
@@ -950,7 +1019,8 @@ fun SettingsDialog(
 fun SignalsView(
   uiState: com.example.ui.TradeUiState,
   viewModel: TradeViewModel,
-  onOpenUrl: (TradeOpportunity) -> Unit
+  onOpenUrl: (TradeOpportunity) -> Unit,
+  watchedIds: Set<String> = emptySet()
 ) {
   val allOpportunities = (uiState.topOpportunities + uiState.opportunities).distinctBy { it.id }
 
@@ -1139,7 +1209,9 @@ fun SignalsView(
           quantResult = uiState.quantAnalysis[op.id],
           newsSentimentResult = uiState.newsSentiment[op.id],
           onAnalyze = { viewModel.analyzeMarket(op) },
-          onTrade = { onOpenUrl(op) }
+          onTrade = { onOpenUrl(op) },
+          isWatched = op.id in watchedIds,
+          onToggleWatch = { viewModel.toggleWatchlist(op) }
         )
       }
     }
@@ -1542,7 +1614,9 @@ fun StandardOpportunityCard(
   quantResult: com.example.ui.QuantAnalysisResult?,
   newsSentimentResult: NewsSentimentResult?,
   onAnalyze: () -> Unit,
-  onTrade: () -> Unit
+  onTrade: () -> Unit,
+  isWatched: Boolean = false,
+  onToggleWatch: (() -> Unit)? = null
 ) {
   Card(
     modifier = Modifier
@@ -1593,6 +1667,17 @@ fun StandardOpportunityCard(
             fontWeight = FontWeight.Bold,
             fontFamily = FontFamily.Monospace
           )
+          if (onToggleWatch != null) {
+            Spacer(modifier = Modifier.width(4.dp))
+            IconButton(onClick = onToggleWatch, modifier = Modifier.size(28.dp)) {
+              Icon(
+                imageVector = if (isWatched) Icons.Default.Star else Icons.Default.StarBorder,
+                contentDescription = if (isWatched) "Remove from watchlist" else "Add to watchlist",
+                tint = if (isWatched) QuantTheme.accentGreen else QuantTheme.textMuted,
+                modifier = Modifier.size(18.dp)
+              )
+            }
+          }
         }
       }
 
@@ -2709,7 +2794,8 @@ fun MovoView(
   onDismiss: () -> Unit,
   onOpenUrl: (String) -> Unit,
   onLoadResearch: (TradeOpportunity) -> Unit = {},
-  onSelectRange: (TradeOpportunity, String) -> Unit = { _, _ -> }
+  onSelectRange: (TradeOpportunity, String) -> Unit = { _, _ -> },
+  onCorrelate: (TradeOpportunity, TradeOpportunity) -> Unit = { _, _ -> }
 ) {
   var showAdvancedAnalytics by remember { mutableStateOf(false) }
 
@@ -2925,6 +3011,139 @@ fun MovoView(
               fontFamily = FontFamily.Monospace
             )
             DepthChart(book = book)
+          }
+        }
+
+        // 2.7 WHALE FEED — large fills from the public Data API
+        val whales = uiState.researchWhales[opportunity.id].orEmpty()
+        if (whales.isNotEmpty()) {
+          Column(
+            modifier = Modifier
+              .fillMaxWidth()
+              .background(Color(0xFF131720), RoundedCornerShape(12.dp))
+              .border(1.dp, QuantTheme.border, RoundedCornerShape(12.dp))
+              .padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp)
+          ) {
+            Text(
+              "🐋 WHALE FEED — FILLS ≥ $1K NOTIONAL",
+              color = QuantTheme.textMuted,
+              fontSize = 12.sp,
+              fontWeight = FontWeight.Bold,
+              letterSpacing = 0.5.sp,
+              fontFamily = FontFamily.Monospace
+            )
+            whales.take(6).forEach { trade ->
+              Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+              ) {
+                Text(
+                  "${trade.side ?: "?"} ${trade.outcome ?: ""}",
+                  color = if (trade.side == "BUY") QuantTheme.accentGreen else QuantTheme.accentRed,
+                  fontSize = 11.sp,
+                  fontWeight = FontWeight.Bold,
+                  fontFamily = FontFamily.Monospace
+                )
+                Text(
+                  String.format(Locale.US, "$%,.0f @ %.1f¢", trade.notionalUsd, (trade.price ?: 0.0) * 100),
+                  color = QuantTheme.textBody,
+                  fontSize = 11.sp,
+                  fontFamily = FontFamily.Monospace
+                )
+                Text(
+                  trade.traderLabel.take(14),
+                  color = QuantTheme.textMuted,
+                  fontSize = 10.sp,
+                  fontFamily = FontFamily.Monospace,
+                  maxLines = 1,
+                  overflow = TextOverflow.Ellipsis
+                )
+              }
+            }
+          }
+        }
+
+        // 2.8 EVENT CORRELATION MATRIX — pair this market against another
+        val correlationCandidates = (uiState.topOpportunities + uiState.opportunities)
+          .filter { it.id != opportunity.id }
+          .distinctBy { it.id }
+          .take(4)
+        if (correlationCandidates.isNotEmpty()) {
+          Column(
+            modifier = Modifier
+              .fillMaxWidth()
+              .background(Color(0xFF131720), RoundedCornerShape(12.dp))
+              .border(1.dp, QuantTheme.border, RoundedCornerShape(12.dp))
+              .padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+          ) {
+            Row(
+              modifier = Modifier.fillMaxWidth(),
+              horizontalArrangement = Arrangement.SpaceBetween,
+              verticalAlignment = Alignment.CenterVertically
+            ) {
+              Text(
+                "EVENT CORRELATION MATRIX",
+                color = QuantTheme.textMuted,
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Bold,
+                letterSpacing = 0.5.sp,
+                fontFamily = FontFamily.Monospace
+              )
+              if (uiState.isCorrelating) {
+                CircularProgressIndicator(
+                  color = QuantTheme.accentGreen,
+                  strokeWidth = 2.dp,
+                  modifier = Modifier.size(14.dp)
+                )
+              }
+            }
+            Text(
+              "Pearson on 1w CLOB histories + AI hedge read. Pair with:",
+              color = QuantTheme.textSubtle,
+              fontSize = 11.sp
+            )
+            correlationCandidates.forEach { other ->
+              Box(
+                modifier = Modifier
+                  .fillMaxWidth()
+                  .clip(RoundedCornerShape(8.dp))
+                  .background(QuantTheme.navButtonBg)
+                  .border(1.dp, QuantTheme.border, RoundedCornerShape(8.dp))
+                  .clickable(enabled = !uiState.isCorrelating) { onCorrelate(opportunity, other) }
+                  .padding(horizontal = 10.dp, vertical = 8.dp)
+              ) {
+                Text(
+                  "⇄ ${other.title}",
+                  color = QuantTheme.textSubtle,
+                  fontSize = 11.sp,
+                  fontFamily = FontFamily.Monospace,
+                  maxLines = 1,
+                  overflow = TextOverflow.Ellipsis
+                )
+              }
+            }
+            if (uiState.correlationText != null) {
+              HorizontalDivider(color = QuantTheme.border, thickness = 0.5.dp)
+              uiState.correlationLabel?.let {
+                Text(
+                  "vs ${it.uppercase()}",
+                  color = QuantTheme.accentGreen,
+                  fontSize = 10.sp,
+                  fontWeight = FontWeight.Bold,
+                  fontFamily = FontFamily.Monospace
+                )
+              }
+              Text(
+                uiState.correlationText ?: "",
+                color = QuantTheme.textBody,
+                fontSize = 12.sp,
+                lineHeight = 17.sp,
+                fontFamily = FontFamily.Monospace
+              )
+            }
           }
         }
 

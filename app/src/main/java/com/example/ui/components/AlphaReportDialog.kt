@@ -55,6 +55,7 @@ fun AlphaReportDialog(
     isGenerating: Boolean,
     onDismiss: () -> Unit,
     onRegenerate: () -> Unit,
+    title: String = "ALPHA REPORT",
 ) {
     val context = LocalContext.current
     Dialog(
@@ -89,7 +90,7 @@ fun AlphaReportDialog(
                         )
                         Column {
                             Text(
-                                "ALPHA REPORT",
+                                title.take(28),
                                 color = QuantTheme.textPrimary,
                                 fontSize = 18.sp,
                                 fontWeight = FontWeight.ExtraBold,

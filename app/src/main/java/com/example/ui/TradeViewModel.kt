@@ -1,7 +1,16 @@
 package com.example.ui
 
-import androidx.lifecycle.ViewModel
+import android.app.Application
+import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.example.data.AppDatabase
+import com.example.data.AppPrefs
+import com.example.data.ResearchReportEntity
+import com.example.data.WatchlistEntity
+import com.example.network.DataApiTrade
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.stateIn
 import com.example.BuildConfig
 import com.example.network.Content
 import com.example.network.GenerateContentRequest
@@ -128,17 +137,102 @@ data class TradeUiState(
     val researchRange: String = "1w", // 1h, 6h, 1d, 1w, 1m, max
     // --- Alpha Report (elite forecaster deep scan) ---
     val alphaReport: String? = null,
+    val alphaReportTitle: String = "ALPHA REPORT",
     val isAlphaGenerating: Boolean = false,
-    val showAlphaDialog: Boolean = false
+    val showAlphaDialog: Boolean = false,
+    // --- Phase 2.4: whale trades + cross-market correlation ---
+    val researchWhales: Map<String, List<DataApiTrade>> = emptyMap(),
+    val correlationText: String? = null,
+    val correlationLabel: String? = null,
+    val isCorrelating: Boolean = false
 )
 
-class TradeViewModel : ViewModel() {
+class TradeViewModel(application: Application) : AndroidViewModel(application) {
     private val microstructureAgent = MarketMicrostructureAgent()
     private val _uiState = MutableStateFlow(TradeUiState())
     val uiState: StateFlow<TradeUiState> = _uiState.asStateFlow()
 
     private val _eventFlow = MutableSharedFlow<String>()
     val eventFlow = _eventFlow.asSharedFlow()
+
+    // --- Phase 2.2: local persistence engine (Room) ---
+    private val db = AppDatabase.get(application)
+
+    /** Ids of watchlisted markets — drives the star toggles. */
+    val watchedIds: StateFlow<Set<String>> = db.watchlistDao().observeIds()
+        .map { it.toSet() }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptySet())
+
+    /** Full watchlist entries for the Watchlist tab (works offline). */
+    val watchlist: StateFlow<List<WatchlistEntity>> = db.watchlistDao().observeAll()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
+    /** Cached AI research reports (Alpha scans, digests, analyses). */
+    val savedReports: StateFlow<List<ResearchReportEntity>> = db.researchReportDao().observeAll()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
+    fun toggleWatchlist(opportunity: TradeOpportunity) {
+        viewModelScope.launch {
+            val dao = db.watchlistDao()
+            if (dao.count(opportunity.id) > 0) {
+                dao.delete(opportunity.id)
+                _eventFlow.emit("Removed from watchlist")
+            } else {
+                dao.insert(
+                    WatchlistEntity(
+                        marketId = opportunity.id,
+                        title = opportunity.title,
+                        url = opportunity.url,
+                        probability = opportunity.probability,
+                        category = opportunity.category,
+                        volume = opportunity.volume,
+                        tokenId = opportunity.tokenId,
+                        conditionId = opportunity.conditionId,
+                        addedAt = System.currentTimeMillis()
+                    )
+                )
+                _eventFlow.emit("Added to watchlist — whale watch is now tracking this market")
+            }
+        }
+    }
+
+    fun removeFromWatchlist(marketId: String) {
+        viewModelScope.launch { db.watchlistDao().delete(marketId) }
+    }
+
+    fun deleteReport(id: Long) {
+        viewModelScope.launch { db.researchReportDao().delete(id) }
+    }
+
+    /** Opens a stored report (from the library or a digest notification). */
+    fun presentReport(title: String, content: String) {
+        _uiState.value = _uiState.value.copy(
+            alphaReport = content,
+            alphaReportTitle = title,
+            isAlphaGenerating = false,
+            showAlphaDialog = true
+        )
+    }
+
+    private fun persistReport(type: String, marketId: String, title: String, content: String, provider: String) {
+        viewModelScope.launch {
+            try {
+                db.researchReportDao().insert(
+                    ResearchReportEntity(
+                        type = type,
+                        marketId = marketId,
+                        title = title,
+                        content = content,
+                        provider = provider,
+                        createdAt = System.currentTimeMillis()
+                    )
+                )
+                db.researchReportDao().pruneOlderThan(
+                    System.currentTimeMillis() - 30L * 24 * 3600 * 1000
+                )
+            } catch (_: Exception) { }
+        }
+    }
 
     init {
         // Initialize with default math nodes
@@ -156,9 +250,19 @@ class TradeViewModel : ViewModel() {
             PortfolioPosition("World Cup Winner", "YES (Brazil)", "8,000 contracts", "$0.24", "$0.28", "+$320.00"),
             PortfolioPosition("Nvidia Blackwell Shipments met", "YES", "2,500 contracts", "$0.65", "$0.62", "-$75.00")
         )
+        // Restore persisted settings (survives process restarts; also read by
+        // the background digest/whale workers).
+        val ctx = getApplication<Application>()
+        val storedWallet = AppPrefs.wallet(ctx)
+        val storedInstructions = AppPrefs.customInstructions(ctx)
         _uiState.value = _uiState.value.copy(
             nodes = defaultNodes,
-            portfolioPositions = emptyList()
+            portfolioPositions = emptyList(),
+            googleApiKey = AppPrefs.googleKey(ctx).ifBlank { _uiState.value.googleApiKey },
+            xaiApiKey = AppPrefs.xaiKey(ctx).ifBlank { _uiState.value.xaiApiKey },
+            openaiApiKey = AppPrefs.openaiKey(ctx).ifBlank { _uiState.value.openaiApiKey },
+            polymarketWallet = storedWallet.ifBlank { _uiState.value.polymarketWallet },
+            customInstructions = storedInstructions.ifBlank { _uiState.value.customInstructions }
         )
         fetchMarkets()
         fetchClobMarketsAndAnalyze()
@@ -189,6 +293,7 @@ class TradeViewModel : ViewModel() {
             isTestnet = isTestnet,
             polymarketAccountUrl = accountUrl
         )
+        AppPrefs.saveWallet(getApplication<Application>(), wallet)
         viewModelScope.launch {
             _eventFlow.emit("Polymarket CLOB API Credential Sync complete.")
         }
@@ -204,6 +309,10 @@ class TradeViewModel : ViewModel() {
             riskTolerance = riskTolerance,
             customInstructions = customInstructions
         )
+        // Persist so settings survive restarts and background workers can read them.
+        val ctx = getApplication<Application>()
+        AppPrefs.saveAiKeys(ctx, googleApiKey, xaiApiKey, openaiApiKey)
+        AppPrefs.saveCustomInstructions(ctx, customInstructions)
         viewModelScope.launch {
             _eventFlow.emit("System settings updated.")
         }
@@ -557,13 +666,32 @@ class TradeViewModel : ViewModel() {
                         null
                     }
                 }
+                // Whale trades (>= $1k notional) for this market, newest first.
+                val whalesDeferred = async {
+                    val conditionId = opportunity.conditionId
+                    if (conditionId != null && conditionId.startsWith("0x")) {
+                        try {
+                            NetworkModule.polymarketDataApi.getTrades(
+                                conditionId = conditionId,
+                                limit = 8,
+                                filterType = "CASH",
+                                filterAmount = 1_000.0
+                            )
+                        } catch (e: Exception) {
+                            emptyList()
+                        }
+                    } else emptyList()
+                }
+
                 val history = historyDeferred.await()
                 val book = bookDeferred.await()
+                val whales = whalesDeferred.await()
                 _uiState.value = _uiState.value.copy(
                     researchHistory = _uiState.value.researchHistory + (oppId to history),
                     researchBooks = if (book != null)
                         _uiState.value.researchBooks + (oppId to book)
                     else _uiState.value.researchBooks,
+                    researchWhales = _uiState.value.researchWhales + (oppId to whales),
                     researchLoadingIds = _uiState.value.researchLoadingIds - oppId
                 )
             } catch (e: Exception) {
@@ -697,7 +825,25 @@ class TradeViewModel : ViewModel() {
                     else -> "No AI provider configured.\n\nAdd a Gemini, xAI Grok, or OpenAI key in Settings to unlock the Alpha engine."
                 }
 
-                _uiState.value = _uiState.value.copy(alphaReport = report, isAlphaGenerating = false)
+                _uiState.value = _uiState.value.copy(
+                    alphaReport = report,
+                    alphaReportTitle = "ALPHA REPORT",
+                    isAlphaGenerating = false
+                )
+                // Cache the expensive scan for offline viewing in the library.
+                if (!report.startsWith("No AI provider configured")) {
+                    persistReport(
+                        type = "ALPHA",
+                        marketId = "",
+                        title = "Alpha Deep Scan (${universe.size} markets)",
+                        content = report,
+                        provider = when {
+                            geminiKey != null -> "Gemini"
+                            xaiKey != null -> "Grok"
+                            else -> "OpenAI"
+                        }
+                    )
+                }
             } catch (e: Exception) {
                 _uiState.value = _uiState.value.copy(
                     alphaReport = "Alpha engine error: ${e.message}",
@@ -705,6 +851,140 @@ class TradeViewModel : ViewModel() {
                 )
             }
         }
+    }
+
+    /* ----------------------------------------------------------------------
+     * Phase 2.4 — Event correlation matrix (quant Pearson + AI hedge read)
+     * -------------------------------------------------------------------- */
+
+    fun clearCorrelation() {
+        _uiState.value = _uiState.value.copy(correlationText = null, correlationLabel = null)
+    }
+
+    /**
+     * Correlates two markets: computes Pearson on hourly-bucketed 1-week
+     * price histories (pure math, on-device), then asks the configured AI
+     * for a correlation narrative + risk-hedge strategy grounded in that
+     * number. Research output only.
+     */
+    fun correlateMarkets(anchor: TradeOpportunity, other: TradeOpportunity) {
+        if (_uiState.value.isCorrelating) return
+        _uiState.value = _uiState.value.copy(
+            isCorrelating = true,
+            correlationLabel = other.title,
+            correlationText = null
+        )
+        viewModelScope.launch {
+            try {
+                val tokenA = resolveTokenId(anchor)
+                val tokenB = resolveTokenId(other)
+                var pearson: Double? = null
+                if (tokenA != null && tokenB != null) {
+                    val histA = async {
+                        try {
+                            NetworkModule.polymarketClobApi.getPriceHistory(tokenA, "1w", 60).toPoints()
+                        } catch (e: Exception) { emptyList() }
+                    }
+                    val histB = async {
+                        try {
+                            NetworkModule.polymarketClobApi.getPriceHistory(tokenB, "1w", 60).toPoints()
+                        } catch (e: Exception) { emptyList() }
+                    }
+                    pearson = computePearson(histA.await(), histB.await())
+                }
+
+                val pearsonLine = pearson?.let {
+                    "Computed Pearson correlation (1w, hourly buckets): ${String.format(Locale.US, "%.3f", it)}"
+                } ?: "Pearson could not be computed (insufficient overlapping history) — estimate structurally."
+
+                val prompt = """
+                    You are an elite cross-market quant strategist for prediction markets. Research only — never advise order execution.
+
+                    MARKET A: "${anchor.title}" — implied ${anchor.probability}%, 24hΔ ${String.format(Locale.US, "%+.1f", anchor.delta)}pts, vol ${anchor.volume}, ends ${anchor.endsAt}
+                    MARKET B: "${other.title}" — implied ${other.probability}%, 24hΔ ${String.format(Locale.US, "%+.1f", other.delta)}pts, vol ${other.volume}, ends ${other.endsAt}
+                    $pearsonLine
+
+                    Output (dense, < 180 words, monospace-friendly):
+                    CORRELATION SCORE: a single number -1.00..+1.00 (use the computed Pearson if given, else your structural estimate) with one line on WHY (shared driver / causal channel / independence).
+                    SECOND-ORDER LINK: if A resolves YES, what happens to B's true probability?
+                    HEDGE STRUCTURE: how a researcher would think about pairing these two markets to isolate or neutralize the shared risk factor (conceptual, no order instructions).
+                    DIVERGENCE TRIGGER: the event that would break the correlation.
+                """.trimIndent()
+
+                val state = _uiState.value
+                val geminiKey = state.googleApiKey.takeIf { it.isNotBlank() && it != "MY_GEMINI_API_KEY" }
+                val xaiKey = state.xaiApiKey.takeIf { it.isNotBlank() && it != "MY_XAI_API_KEY" }
+                val openaiKey = state.openaiApiKey.takeIf { it.isNotBlank() && it != "MY_OPENAI_API_KEY" }
+
+                val analysis: String = when {
+                    geminiKey != null -> NetworkModule.geminiApi.generateContent(
+                        geminiKey,
+                        GenerateContentRequest(listOf(Content(listOf(Part(text = prompt)))))
+                    ).candidates?.firstOrNull()?.content?.parts?.firstOrNull()?.text
+                        ?: "Correlation engine returned no content."
+                    xaiKey != null -> NetworkModule.grokApi.getChatCompletions(
+                        "Bearer $xaiKey",
+                        com.example.network.GrokChatRequest(
+                            messages = listOf(
+                                com.example.network.GrokMessage("system", "You are an elite cross-market quant strategist."),
+                                com.example.network.GrokMessage("user", prompt)
+                            )
+                        )
+                    ).choices?.firstOrNull()?.message?.content ?: "Correlation engine returned no content."
+                    openaiKey != null -> NetworkModule.openAiApi.getChatCompletions(
+                        "Bearer $openaiKey",
+                        com.example.network.OpenAiChatRequest(
+                            messages = listOf(
+                                com.example.network.OpenAiMessage("system", "You are an elite cross-market quant strategist."),
+                                com.example.network.OpenAiMessage("user", prompt)
+                            )
+                        )
+                    ).choices?.firstOrNull()?.message?.content ?: "Correlation engine returned no content."
+                    else -> "No AI provider configured. Add a key in Settings to unlock the correlation engine." +
+                        (pearson?.let { "\n\nComputed Pearson (1w): ${String.format(Locale.US, "%.3f", it)}" } ?: "")
+                }
+
+                _uiState.value = _uiState.value.copy(correlationText = analysis, isCorrelating = false)
+                persistReport(
+                    type = "CORRELATION",
+                    marketId = anchor.id,
+                    title = "Correlation: ${anchor.title.take(30)} × ${other.title.take(30)}",
+                    content = analysis,
+                    provider = "auto"
+                )
+            } catch (e: Exception) {
+                _uiState.value = _uiState.value.copy(
+                    correlationText = "Correlation engine error: ${e.message}",
+                    isCorrelating = false
+                )
+            }
+        }
+    }
+
+    /** Pearson on hourly-bucketed aligned samples; null when overlap < 8h. */
+    private fun computePearson(
+        a: List<com.example.network.HistoryPoint>,
+        b: List<com.example.network.HistoryPoint>
+    ): Double? {
+        if (a.isEmpty() || b.isEmpty()) return null
+        fun bucket(points: List<com.example.network.HistoryPoint>): Map<Long, Double> =
+            points.groupBy { it.timeSec / 3600 }.mapValues { (_, v) -> v.map { it.price }.average() }
+        val ba = bucket(a)
+        val bb = bucket(b)
+        val keys = ba.keys.intersect(bb.keys).sorted()
+        if (keys.size < 8) return null
+        val xs = keys.map { ba.getValue(it) }
+        val ys = keys.map { bb.getValue(it) }
+        val mx = xs.average()
+        val my = ys.average()
+        var num = 0.0; var dx = 0.0; var dy = 0.0
+        for (i in keys.indices) {
+            val vx = xs[i] - mx
+            val vy = ys[i] - my
+            num += vx * vy; dx += vx * vx; dy += vy * vy
+        }
+        if (dx == 0.0 || dy == 0.0) return null
+        return (num / kotlin.math.sqrt(dx * dy)).coerceIn(-1.0, 1.0)
     }
 
     private fun triggerToastsForTopTrades(topTrades: List<TradeOpportunity>) {
@@ -1117,6 +1397,30 @@ class TradeViewModel : ViewModel() {
                     grokAnalysis = _uiState.value.grokAnalysis + (oppId to grokAnalysisText),
                     openaiAnalysis = _uiState.value.openaiAnalysis + (oppId to openAiAnalysisText),
                     newsSentiment = _uiState.value.newsSentiment + (oppId to sentimentResult)
+                )
+
+                // Cache the multi-provider analysis for offline viewing.
+                persistReport(
+                    type = "ANALYSIS",
+                    marketId = oppId,
+                    title = "Analysis: ${opportunity.title.take(48)}",
+                    content = buildString {
+                        appendLine("MARKET: ${opportunity.title}")
+                        appendLine()
+                        appendLine("── MATH CONSENSUS (Gemini) ──")
+                        appendLine(analysisText)
+                        appendLine()
+                        appendLine("── GROK PREDICTIVE ──")
+                        appendLine(grokAnalysisText)
+                        appendLine()
+                        appendLine("── OPENAI STRATEGIST ──")
+                        appendLine(openAiAnalysisText)
+                        appendLine()
+                        appendLine("── NEWS SENTIMENT ──")
+                        appendLine("${sentimentResult.sentimentLabel} (${String.format(Locale.US, "%+.2f", sentimentResult.sentimentScore)})")
+                        appendLine(sentimentResult.reasoning)
+                    },
+                    provider = "multi"
                 )
             } catch (e: Exception) {
                 _uiState.value = _uiState.value.copy(

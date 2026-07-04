@@ -91,6 +91,26 @@ interface PolymarketDataApiService {
     suspend fun getPositions(
         @Query("user") address: String
     ): List<DataApiPosition>
+
+    /**
+     * Recent trades for a market (0x… condition id). Pair filterType=CASH
+     * with filterAmount to get only whale-sized fills (notional >= $amount).
+     */
+    @GET("trades")
+    suspend fun getTrades(
+        @Query("market") conditionId: String,
+        @Query("limit") limit: Int = 25,
+        @Query("takerOnly") takerOnly: Boolean = true,
+        @Query("filterType") filterType: String? = null,
+        @Query("filterAmount") filterAmount: Double? = null
+    ): List<DataApiTrade>
+
+    /** Top holders per outcome token for a market. */
+    @GET("holders")
+    suspend fun getHolders(
+        @Query("market") conditionId: String,
+        @Query("limit") limit: Int = 20
+    ): List<DataApiMetaHolder>
 }
 
 data class DataApiPosition(
@@ -99,6 +119,38 @@ data class DataApiPosition(
     val size: String?,
     val price: String?,
     val value: String?
+)
+
+data class DataApiTrade(
+    val proxyWallet: String? = null,
+    val side: String? = null,
+    val size: Double? = null,
+    val price: Double? = null,
+    val timestamp: Long? = null, // unix seconds
+    val title: String? = null,
+    val outcome: String? = null,
+    val name: String? = null,
+    val pseudonym: String? = null,
+    val transactionHash: String? = null
+) {
+    val notionalUsd: Double get() = (size ?: 0.0) * (price ?: 0.0)
+    val traderLabel: String
+        get() = name?.takeIf { it.isNotBlank() }
+            ?: pseudonym?.takeIf { it.isNotBlank() }
+            ?: proxyWallet?.let { "${it.take(6)}…${it.takeLast(4)}" } ?: "anon"
+}
+
+data class DataApiMetaHolder(
+    val token: String? = null,
+    val holders: List<DataApiHolder>? = null
+)
+
+data class DataApiHolder(
+    val proxyWallet: String? = null,
+    val name: String? = null,
+    val pseudonym: String? = null,
+    val amount: Double? = null,
+    val outcomeIndex: Int? = null
 )
 
 interface GeminiApiService {
