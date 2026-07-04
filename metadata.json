@@ -1,6 +1,6 @@
 {
   "name": "PolyTrader",
-  "description": "Simple and clean prediction market trading for Polymarket.",
+  "description": "Polymarket Research Companion - analytics, AI insights, and market discovery.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }
