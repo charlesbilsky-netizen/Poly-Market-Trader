@@ -1,7 +1,16 @@
 package com.example.ui
 
-import androidx.lifecycle.ViewModel
+import android.app.Application
+import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.example.data.AppDatabase
+import com.example.data.AppPrefs
+import com.example.data.ResearchReportEntity
+import com.example.data.WatchlistEntity
+import com.example.network.DataApiTrade
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.stateIn
 import com.example.BuildConfig
 import com.example.network.Content
 import com.example.network.GenerateContentRequest
@@ -11,6 +20,11 @@ import com.example.network.PolymarketEvent
 import com.example.network.PolymarketMarket
 import com.example.network.NewsSentimentResult
 import com.example.network.NewsSentimentAnalyzer
+import com.example.network.parseJsonDoubleArray
+import com.example.network.parseJsonStringArray
+import com.example.network.toPoints
+import com.example.network.toSnapshot
+import kotlinx.coroutines.async
 import com.example.network.MarketMicrostructureAgent
 import com.example.network.MicrostructureSignal
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -91,12 +105,12 @@ data class TradeUiState(
     val searchInterval: String = "1h",
     val rsiThreshold: Int = 14,
     val hftWeight: Int = 75,
-    val polymarketWallet: String = "0x7f7694c9cafba9ce64f430cd62914d816d222e21",
-    val polymarketApiKey: String = "ad069ff3-3628-734c-a8c4-504d6b74c363",
-    val polymarketApiSecret: String = "xjM0dqh1wA5ptTSYBfwGVOD8wLFkXDSEhhXswjG1PUo=",
-    val polymarketApiPassphrase: String = "9c2861d3f8b362db7acb3f755ed32e83814ceba479b6fb8d7b4b7b6afa093a8f",
+    val polymarketWallet: String = "",
+    val polymarketApiKey: String = "",
+    val polymarketApiSecret: String = "",
+    val polymarketApiPassphrase: String = "",
     val isTestnet: Boolean = false,
-    val polymarketAccountUrl: String = "https://polymarket.com/event/world-cup-winner#TeT1jBP",
+    val polymarketAccountUrl: String = "https://polymarket.com",
     val googleApiKey: String = BuildConfig.GEMINI_API_KEY,
     val xaiApiKey: String = BuildConfig.XAI_API_KEY,
     val openaiApiKey: String = BuildConfig.OPENAI_API_KEY,
@@ -115,16 +129,110 @@ data class TradeUiState(
     val webSocketLogs: List<String> = emptyList(),
     val webSocketUpdatesCount: Int = 0,
     val grokAnalysis: Map<String, String> = emptyMap(),
-    val openaiAnalysis: Map<String, String> = emptyMap()
+    val openaiAnalysis: Map<String, String> = emptyMap(),
+    // --- Phase 2.1: real CLOB market-data research (charts) ---
+    val researchHistory: Map<String, List<com.example.network.HistoryPoint>> = emptyMap(),
+    val researchBooks: Map<String, com.example.network.BookSnapshot> = emptyMap(),
+    val researchLoadingIds: Set<String> = emptySet(),
+    val researchRange: String = "1w", // 1h, 6h, 1d, 1w, 1m, max
+    // --- Alpha Report (elite forecaster deep scan) ---
+    val alphaReport: String? = null,
+    val alphaReportTitle: String = "ALPHA REPORT",
+    val isAlphaGenerating: Boolean = false,
+    val showAlphaDialog: Boolean = false,
+    // --- Phase 2.4: whale trades + cross-market correlation ---
+    val researchWhales: Map<String, List<DataApiTrade>> = emptyMap(),
+    val correlationText: String? = null,
+    val correlationLabel: String? = null,
+    val isCorrelating: Boolean = false
 )
 
-class TradeViewModel : ViewModel() {
+class TradeViewModel(application: Application) : AndroidViewModel(application) {
     private val microstructureAgent = MarketMicrostructureAgent()
     private val _uiState = MutableStateFlow(TradeUiState())
     val uiState: StateFlow<TradeUiState> = _uiState.asStateFlow()
 
     private val _eventFlow = MutableSharedFlow<String>()
     val eventFlow = _eventFlow.asSharedFlow()
+
+    // --- Phase 2.2: local persistence engine (Room) ---
+    private val db = AppDatabase.get(application)
+
+    /** Ids of watchlisted markets — drives the star toggles. */
+    val watchedIds: StateFlow<Set<String>> = db.watchlistDao().observeIds()
+        .map { it.toSet() }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptySet())
+
+    /** Full watchlist entries for the Watchlist tab (works offline). */
+    val watchlist: StateFlow<List<WatchlistEntity>> = db.watchlistDao().observeAll()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
+    /** Cached AI research reports (Alpha scans, digests, analyses). */
+    val savedReports: StateFlow<List<ResearchReportEntity>> = db.researchReportDao().observeAll()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
+    fun toggleWatchlist(opportunity: TradeOpportunity) {
+        viewModelScope.launch {
+            val dao = db.watchlistDao()
+            if (dao.count(opportunity.id) > 0) {
+                dao.delete(opportunity.id)
+                _eventFlow.emit("Removed from watchlist")
+            } else {
+                dao.insert(
+                    WatchlistEntity(
+                        marketId = opportunity.id,
+                        title = opportunity.title,
+                        url = opportunity.url,
+                        probability = opportunity.probability,
+                        category = opportunity.category,
+                        volume = opportunity.volume,
+                        tokenId = opportunity.tokenId,
+                        conditionId = opportunity.conditionId,
+                        addedAt = System.currentTimeMillis()
+                    )
+                )
+                _eventFlow.emit("Added to watchlist — whale watch is now tracking this market")
+            }
+        }
+    }
+
+    fun removeFromWatchlist(marketId: String) {
+        viewModelScope.launch { db.watchlistDao().delete(marketId) }
+    }
+
+    fun deleteReport(id: Long) {
+        viewModelScope.launch { db.researchReportDao().delete(id) }
+    }
+
+    /** Opens a stored report (from the library or a digest notification). */
+    fun presentReport(title: String, content: String) {
+        _uiState.value = _uiState.value.copy(
+            alphaReport = content,
+            alphaReportTitle = title,
+            isAlphaGenerating = false,
+            showAlphaDialog = true
+        )
+    }
+
+    private fun persistReport(type: String, marketId: String, title: String, content: String, provider: String) {
+        viewModelScope.launch {
+            try {
+                db.researchReportDao().insert(
+                    ResearchReportEntity(
+                        type = type,
+                        marketId = marketId,
+                        title = title,
+                        content = content,
+                        provider = provider,
+                        createdAt = System.currentTimeMillis()
+                    )
+                )
+                db.researchReportDao().pruneOlderThan(
+                    System.currentTimeMillis() - 30L * 24 * 3600 * 1000
+                )
+            } catch (_: Exception) { }
+        }
+    }
 
     init {
         // Initialize with default math nodes
@@ -142,9 +250,19 @@ class TradeViewModel : ViewModel() {
             PortfolioPosition("World Cup Winner", "YES (Brazil)", "8,000 contracts", "$0.24", "$0.28", "+$320.00"),
             PortfolioPosition("Nvidia Blackwell Shipments met", "YES", "2,500 contracts", "$0.65", "$0.62", "-$75.00")
         )
+        // Restore persisted settings (survives process restarts; also read by
+        // the background digest/whale workers).
+        val ctx = getApplication<Application>()
+        val storedWallet = AppPrefs.wallet(ctx)
+        val storedInstructions = AppPrefs.customInstructions(ctx)
         _uiState.value = _uiState.value.copy(
             nodes = defaultNodes,
-            portfolioPositions = emptyList()
+            portfolioPositions = emptyList(),
+            googleApiKey = AppPrefs.googleKey(ctx).ifBlank { _uiState.value.googleApiKey },
+            xaiApiKey = AppPrefs.xaiKey(ctx).ifBlank { _uiState.value.xaiApiKey },
+            openaiApiKey = AppPrefs.openaiKey(ctx).ifBlank { _uiState.value.openaiApiKey },
+            polymarketWallet = storedWallet.ifBlank { _uiState.value.polymarketWallet },
+            customInstructions = storedInstructions.ifBlank { _uiState.value.customInstructions }
         )
         fetchMarkets()
         fetchClobMarketsAndAnalyze()
@@ -175,6 +293,7 @@ class TradeViewModel : ViewModel() {
             isTestnet = isTestnet,
             polymarketAccountUrl = accountUrl
         )
+        AppPrefs.saveWallet(getApplication<Application>(), wallet)
         viewModelScope.launch {
             _eventFlow.emit("Polymarket CLOB API Credential Sync complete.")
         }
@@ -190,6 +309,10 @@ class TradeViewModel : ViewModel() {
             riskTolerance = riskTolerance,
             customInstructions = customInstructions
         )
+        // Persist so settings survive restarts and background workers can read them.
+        val ctx = getApplication<Application>()
+        AppPrefs.saveAiKeys(ctx, googleApiKey, xaiApiKey, openaiApiKey)
+        AppPrefs.saveCustomInstructions(ctx, customInstructions)
         viewModelScope.launch {
             _eventFlow.emit("System settings updated.")
         }
@@ -313,96 +436,58 @@ class TradeViewModel : ViewModel() {
         }
     }
 
-    fun executeLimitOrder(opportunity: TradeOpportunity, quantity: Double, price: Double, outcome: String) {
-        viewModelScope.launch {
-            _uiState.value = _uiState.value.copy(isLoading = true)
-            
-            val isConfigured = _uiState.value.polymarketWallet.isNotBlank() && 
-                               _uiState.value.polymarketApiKey.isNotBlank() &&
-                               _uiState.value.polymarketApiSecret.isNotBlank()
-            
-            if (!isConfigured) {
-                _uiState.value = _uiState.value.copy(isLoading = false)
-                _eventFlow.emit("Security Warning: EIP-712 execution failed. Complete API configuration first.")
-                return@launch
-            }
-            
-            // Format EIP-712 Order parameters
-            val salt = System.currentTimeMillis().toString()
-            val expiration = (System.currentTimeMillis() / 1000 + 3600).toString() // 1 hour expiry
-            val tokenId = opportunity.id.hashCode().toString()
-            
-            // Total cost in USDC
-            val totalCost = quantity * price
-            
-            // Build real CLOB request model
-            val clobOrder = com.example.network.ClobOrder(
-                signer = _uiState.value.polymarketWallet,
-                maker = _uiState.value.polymarketWallet,
-                taker = "0x0000000000000000000000000000000000000000",
-                tokenId = tokenId,
-                makerAmount = String.format(Locale.US, "%.6f", totalCost),
-                takerAmount = String.format(Locale.US, "%.6f", quantity),
-                side = if (outcome.uppercase() == "YES") 0 else 1,
-                expiration = expiration,
-                nonce = "1",
-                salt = salt,
-                signature = "0x" + "a".repeat(130) // Cryptographic mock signature
-            )
-            
-            val request = com.example.network.ClobOrderRequest(
-                order = clobOrder,
-                owner = _uiState.value.polymarketWallet
-            )
-            
-            try {
-                // Submit to real Polymarket CLOB
-                val response = try {
-                    NetworkModule.polymarketClobApi.placeOrder(request)
-                } catch (e: Exception) {
-                    // Fallback to locally signed successful response for sandbox/dev flow
-                    com.example.network.ClobOrderResponse(
-                        success = true,
-                        orderHash = "0x" + Random.nextLong().toString(16).padStart(16, '0') + Random.nextLong().toString(16).padStart(16, '0'),
-                        errorMsg = null
-                    )
-                }
-                
-                if (response.success == true) {
-                    val formattedPrice = String.format(Locale.US, "$%.2f", price)
-                    val formattedSize = String.format(Locale.US, "%,.0f contracts", quantity)
-                    val formattedProfit = "$0.00"
-                    
-                    // Add position to live Portfolio
-                    val newPosition = PortfolioPosition(
-                        title = opportunity.title,
-                        position = outcome.uppercase(),
-                        size = formattedSize,
-                        entry = formattedPrice,
-                        current = formattedPrice,
-                        profit = formattedProfit
-                    )
-                    
-                    _uiState.value = _uiState.value.copy(
-                        isLoading = false,
-                        portfolioPositions = listOf(newPosition) + _uiState.value.portfolioPositions
-                    )
-                    _eventFlow.emit("SECURE EIP-712 SUCCESS: Limit order submitted. Hash: ${response.orderHash}")
-                } else {
-                    _uiState.value = _uiState.value.copy(isLoading = false)
-                    _eventFlow.emit("CLOB rejection: ${response.errorMsg ?: "Invalid Signature"}")
-                }
-            } catch (e: Exception) {
-                _uiState.value = _uiState.value.copy(isLoading = false)
-                _eventFlow.emit("Execution error: ${e.message}")
-            }
-        }
-    }
-
     fun dismissNotification(id: String) {
         _uiState.value = _uiState.value.copy(
             toastNotifications = _uiState.value.toastNotifications.filter { it.id != id }
         )
+    }
+
+    fun fetchPortfolioPositions() {
+        viewModelScope.launch {
+            val wallet = _uiState.value.polymarketWallet
+            if (wallet.isBlank()) {
+                _eventFlow.emit("Please set your wallet address in settings.")
+                return@launch
+            }
+            
+            _uiState.value = _uiState.value.copy(isLoading = true)
+            try {
+                val positions = NetworkModule.polymarketDataApi.getPositions(wallet)
+                val mappedPositions = positions.mapNotNull { pos ->
+                    val sizeValue = pos.size?.toDoubleOrNull() ?: return@mapNotNull null
+                    if (sizeValue <= 0.0) return@mapNotNull null // Ignore zero or negative positions
+
+                    val priceValue = pos.price?.toDoubleOrNull() ?: 0.0
+                    val currentVal = pos.value?.toDoubleOrNull() ?: 0.0
+                    
+                    val formattedPrice = String.format(Locale.US, "$%.2f", priceValue)
+                    val formattedCurrent = String.format(Locale.US, "$%.2f", currentVal)
+                    val formattedSize = String.format(Locale.US, "%,.0f shares", sizeValue)
+
+                    PortfolioPosition(
+                        title = "Asset: ${pos.asset?.take(8) ?: "Unknown"}",
+                        position = "N/A",
+                        size = formattedSize,
+                        entry = formattedPrice,
+                        current = formattedCurrent,
+                        profit = "$0.00" // Requires historical entry data to calculate accurately
+                    )
+                }
+
+                _uiState.value = _uiState.value.copy(
+                    isLoading = false,
+                    portfolioPositions = mappedPositions
+                )
+                if (mappedPositions.isEmpty()) {
+                    _eventFlow.emit("No active positions found for this wallet.")
+                } else {
+                    _eventFlow.emit("Fetched ${mappedPositions.size} positions from Data API.")
+                }
+            } catch (e: Exception) {
+                _uiState.value = _uiState.value.copy(isLoading = false)
+                _eventFlow.emit("Error fetching portfolio: ${e.message}")
+            }
+        }
     }
 
     fun fetchMarkets() {
@@ -451,8 +536,9 @@ class TradeViewModel : ViewModel() {
             _uiState.value = _uiState.value.copy(isClobLoading = true, error = null)
             try {
                 // 1. Fetch real-time market data from Polymarket CLOB API
+                // (paginated envelope: { data: [...], next_cursor })
                 val clobMarkets = try {
-                    NetworkModule.polymarketClobApi.getMarkets()
+                    NetworkModule.polymarketClobApi.getMarkets().data ?: emptyList()
                 } catch (e: Exception) {
                     android.util.Log.e("QuantTrading", "CLOB API fetch failed: ${e.message}", e)
                     emptyList()
@@ -484,7 +570,9 @@ class TradeViewModel : ViewModel() {
                         volume = "$--",
                         liquidity = "Real-time",
                         hftSignal = "FETCHING",
-                        category = "CLOB"
+                        category = "CLOB",
+                        tokenId = token?.token_id,
+                        conditionId = market.condition_id
                     )
                 }
 
@@ -515,6 +603,388 @@ class TradeViewModel : ViewModel() {
                 _uiState.value = _uiState.value.copy(isClobLoading = false, error = "CLOB Sync Error: ${e.message}")
             }
         }
+    }
+
+    /* ----------------------------------------------------------------------
+     * Phase 2.1 — Real market research data (CLOB prices-history + book)
+     * -------------------------------------------------------------------- */
+
+    /** Fidelity floors per the CLOB API (1w >= 5min, 1m >= 10min). */
+    private fun fidelityFor(range: String): Int = when (range) {
+        "1h" -> 1
+        "6h" -> 5
+        "1d" -> 10
+        "1w" -> 60
+        "1m" -> 180
+        else -> 720 // max
+    }
+
+    fun setResearchRange(opportunity: TradeOpportunity, range: String) {
+        _uiState.value = _uiState.value.copy(researchRange = range)
+        loadMarketResearch(opportunity, forceReload = true)
+    }
+
+    /**
+     * Loads the real probability history + order book for a market. Resolves
+     * the CLOB token id through (in order): the opportunity itself, the CLOB
+     * market by condition id, or the Gamma market by slug. Read-only.
+     */
+    fun loadMarketResearch(opportunity: TradeOpportunity, forceReload: Boolean = false) {
+        val oppId = opportunity.id
+        if (!forceReload && _uiState.value.researchHistory.containsKey(oppId)) return
+        if (oppId in _uiState.value.researchLoadingIds) return
+
+        _uiState.value = _uiState.value.copy(
+            researchLoadingIds = _uiState.value.researchLoadingIds + oppId
+        )
+        viewModelScope.launch {
+            try {
+                val tokenId = resolveTokenId(opportunity)
+                if (tokenId == null) {
+                    _uiState.value = _uiState.value.copy(
+                        researchLoadingIds = _uiState.value.researchLoadingIds - oppId,
+                        researchHistory = _uiState.value.researchHistory + (oppId to emptyList())
+                    )
+                    return@launch
+                }
+                val range = _uiState.value.researchRange
+                val historyDeferred = async {
+                    try {
+                        NetworkModule.polymarketClobApi
+                            .getPriceHistory(tokenId, range, fidelityFor(range))
+                            .toPoints()
+                    } catch (e: Exception) {
+                        android.util.Log.e("QuantTrading", "prices-history failed: ${e.message}")
+                        emptyList()
+                    }
+                }
+                val bookDeferred = async {
+                    try {
+                        NetworkModule.polymarketClobApi.getBook(tokenId).toSnapshot()
+                    } catch (e: Exception) {
+                        android.util.Log.e("QuantTrading", "book fetch failed: ${e.message}")
+                        null
+                    }
+                }
+                // Whale trades (>= $1k notional) for this market, newest first.
+                val whalesDeferred = async {
+                    val conditionId = opportunity.conditionId
+                    if (conditionId != null && conditionId.startsWith("0x")) {
+                        try {
+                            NetworkModule.polymarketDataApi.getTrades(
+                                conditionId = conditionId,
+                                limit = 8,
+                                filterType = "CASH",
+                                filterAmount = 1_000.0
+                            )
+                        } catch (e: Exception) {
+                            emptyList()
+                        }
+                    } else emptyList()
+                }
+
+                val history = historyDeferred.await()
+                val book = bookDeferred.await()
+                val whales = whalesDeferred.await()
+                _uiState.value = _uiState.value.copy(
+                    researchHistory = _uiState.value.researchHistory + (oppId to history),
+                    researchBooks = if (book != null)
+                        _uiState.value.researchBooks + (oppId to book)
+                    else _uiState.value.researchBooks,
+                    researchWhales = _uiState.value.researchWhales + (oppId to whales),
+                    researchLoadingIds = _uiState.value.researchLoadingIds - oppId
+                )
+            } catch (e: Exception) {
+                _uiState.value = _uiState.value.copy(
+                    researchLoadingIds = _uiState.value.researchLoadingIds - oppId
+                )
+            }
+        }
+    }
+
+    private suspend fun resolveTokenId(opportunity: TradeOpportunity): String? {
+        opportunity.tokenId?.takeIf { it.isNotBlank() }?.let { return it }
+
+        // Try the CLOB market by condition id (0x…).
+        opportunity.conditionId?.takeIf { it.startsWith("0x") }?.let { conditionId ->
+            try {
+                val market = NetworkModule.polymarketClobApi.getMarket(conditionId)
+                val token = market.tokens?.firstOrNull { it.outcome.equals("Yes", true) }
+                    ?: market.tokens?.firstOrNull()
+                token?.token_id?.let { return it }
+            } catch (_: Exception) { }
+        }
+
+        // Try Gamma by market slug extracted from the deep-link URL.
+        val slug = opportunity.url.substringAfterLast("/event/", "")
+            .substringAfterLast("/")
+            .substringBefore("#").substringBefore("?")
+        if (slug.isNotBlank()) {
+            try {
+                val markets = NetworkModule.polymarketApi.getMarketsBySlug(slug)
+                parseJsonStringArray(markets.firstOrNull()?.clobTokenIds)
+                    .firstOrNull()?.let { return it }
+            } catch (_: Exception) { }
+        }
+        return null
+    }
+
+    /* ----------------------------------------------------------------------
+     * Alpha Report — elite quantitative forecaster deep scan
+     * -------------------------------------------------------------------- */
+
+    fun dismissAlphaDialog() {
+        _uiState.value = _uiState.value.copy(showAlphaDialog = false)
+    }
+
+    fun generateAlphaReport() {
+        if (_uiState.value.isAlphaGenerating) return
+        val universe = (_uiState.value.topOpportunities + _uiState.value.opportunities +
+            _uiState.value.clobOpportunities).distinctBy { it.id }.take(12)
+        if (universe.isEmpty()) {
+            viewModelScope.launch { _eventFlow.emit("Scan markets first, then run the Alpha engine.") }
+            return
+        }
+        _uiState.value = _uiState.value.copy(isAlphaGenerating = true, showAlphaDialog = true)
+
+        viewModelScope.launch {
+            try {
+                val marketTable = universe.mapIndexed { i, op ->
+                    "${i + 1}. \"${op.title}\" | implied ${op.probability}% | 24hΔ ${
+                        String.format(Locale.US, "%+.1f", op.delta)
+                    }pts | vol ${op.volume} | liq ${op.liquidity} | ends ${op.endsAt} | ${op.category}"
+                }.joinToString("\n")
+
+                val prompt = """
+                    [SYSTEM PERSONA: ELITE QUANTITATIVE FORECASTER & MACRO STRATEGIST]
+                    Act as a world-class Quantitative Researcher, Elite Superforecaster (top 1% of the Good Judgment Project), and Behavioral Economist. Combine the mathematical rigor of Renaissance Technologies, the geopolitical intelligence of Palantir, and the behavioral edge of Richard Thaler.
+
+                    [OBJECTIVE]
+                    Identify mispriced prediction markets, structural alpha, and information asymmetries in the live Polymarket universe below. Find edge (EV > 0) where crowd sentiment has decoupled from base rates and true Bayesian probabilities.
+
+                    [ANALYTICAL FRAMEWORKS — APPLY STRICTLY]
+                    1. Bayesian Updating: state the historical base rate for each event category explicitly, then update on current evidence.
+                    2. Behavioral Divergence: flag where narrative momentum or retail panic has pushed implied probability away from true probability.
+                    3. Liquidity & Spread Dynamics: a 2% edge in a thin market is untradable — weight by the volume/liquidity data provided.
+                    4. Second-Order Effects: cascading consequences; if X resolves, what unpriced Y becomes probable?
+                    5. Tail Risk: identify "cheap options" — markets <8% or >92% where structural tail risk is materially higher.
+
+                    [LIVE POLYMARKET UNIVERSE — REAL DATA]
+                    $marketTable
+
+                    [OUTPUT FORMAT — ALPHA REPORT]
+                    ### 1. MACRO THESIS & STRUCTURAL INEFFICIENCIES
+                    2-3 narratives where the crowd is wrong or lagging, with the specific information asymmetry.
+                    ### 2. HIGH-CONVICTION TARGETS (Top 3 from the universe above)
+                    For each: Market | Implied % | True Bayesian % | Edge (EV math) | 3-sentence thesis citing base rates | Catalyst timeline.
+                    ### 3. THE CHEAP OPTION / TAIL RISK PLAY
+                    One market <8% or >92% with mispriced tail risk and the specific trigger scenario.
+                    ### 4. INVALIDATION CRITERIA
+                    The specific data point or event that would kill each thesis.
+
+                    [EXECUTION RULES]
+                    Zero fluff. Dense, high-signal, institutional language. Take probabilistic stands. If a market shows no edge, state "NO EDGE" and move on. This is research output for a read-only companion app — never instruct order execution.
+                """.trimIndent()
+
+                val state = _uiState.value
+                val geminiKey = state.googleApiKey.takeIf { it.isNotBlank() && it != "MY_GEMINI_API_KEY" }
+                val xaiKey = state.xaiApiKey.takeIf { it.isNotBlank() && it != "MY_XAI_API_KEY" }
+                val openaiKey = state.openaiApiKey.takeIf { it.isNotBlank() && it != "MY_OPENAI_API_KEY" }
+
+                val report: String = when {
+                    geminiKey != null -> {
+                        val request = GenerateContentRequest(
+                            contents = listOf(Content(parts = listOf(Part(text = prompt))))
+                        )
+                        NetworkModule.geminiApi.generateContent(geminiKey, request)
+                            .candidates?.firstOrNull()?.content?.parts?.firstOrNull()?.text
+                            ?: "Alpha engine returned no content — try again."
+                    }
+                    xaiKey != null -> {
+                        val request = com.example.network.GrokChatRequest(
+                            messages = listOf(
+                                com.example.network.GrokMessage("system", "You are an elite quantitative forecaster."),
+                                com.example.network.GrokMessage("user", prompt)
+                            )
+                        )
+                        NetworkModule.grokApi.getChatCompletions("Bearer $xaiKey", request)
+                            .choices?.firstOrNull()?.message?.content
+                            ?: "Alpha engine returned no content — try again."
+                    }
+                    openaiKey != null -> {
+                        val request = com.example.network.OpenAiChatRequest(
+                            messages = listOf(
+                                com.example.network.OpenAiMessage("system", "You are an elite quantitative forecaster."),
+                                com.example.network.OpenAiMessage("user", prompt)
+                            )
+                        )
+                        NetworkModule.openAiApi.getChatCompletions("Bearer $openaiKey", request)
+                            .choices?.firstOrNull()?.message?.content
+                            ?: "Alpha engine returned no content — try again."
+                    }
+                    else -> "No AI provider configured.\n\nAdd a Gemini, xAI Grok, or OpenAI key in Settings to unlock the Alpha engine."
+                }
+
+                _uiState.value = _uiState.value.copy(
+                    alphaReport = report,
+                    alphaReportTitle = "ALPHA REPORT",
+                    isAlphaGenerating = false
+                )
+                // Cache the expensive scan for offline viewing in the library.
+                if (!report.startsWith("No AI provider configured")) {
+                    persistReport(
+                        type = "ALPHA",
+                        marketId = "",
+                        title = "Alpha Deep Scan (${universe.size} markets)",
+                        content = report,
+                        provider = when {
+                            geminiKey != null -> "Gemini"
+                            xaiKey != null -> "Grok"
+                            else -> "OpenAI"
+                        }
+                    )
+                }
+            } catch (e: Exception) {
+                _uiState.value = _uiState.value.copy(
+                    alphaReport = "Alpha engine error: ${e.message}",
+                    isAlphaGenerating = false
+                )
+            }
+        }
+    }
+
+    /* ----------------------------------------------------------------------
+     * Phase 2.4 — Event correlation matrix (quant Pearson + AI hedge read)
+     * -------------------------------------------------------------------- */
+
+    fun clearCorrelation() {
+        _uiState.value = _uiState.value.copy(correlationText = null, correlationLabel = null)
+    }
+
+    /**
+     * Correlates two markets: computes Pearson on hourly-bucketed 1-week
+     * price histories (pure math, on-device), then asks the configured AI
+     * for a correlation narrative + risk-hedge strategy grounded in that
+     * number. Research output only.
+     */
+    fun correlateMarkets(anchor: TradeOpportunity, other: TradeOpportunity) {
+        if (_uiState.value.isCorrelating) return
+        _uiState.value = _uiState.value.copy(
+            isCorrelating = true,
+            correlationLabel = other.title,
+            correlationText = null
+        )
+        viewModelScope.launch {
+            try {
+                val tokenA = resolveTokenId(anchor)
+                val tokenB = resolveTokenId(other)
+                var pearson: Double? = null
+                if (tokenA != null && tokenB != null) {
+                    val histA = async {
+                        try {
+                            NetworkModule.polymarketClobApi.getPriceHistory(tokenA, "1w", 60).toPoints()
+                        } catch (e: Exception) { emptyList() }
+                    }
+                    val histB = async {
+                        try {
+                            NetworkModule.polymarketClobApi.getPriceHistory(tokenB, "1w", 60).toPoints()
+                        } catch (e: Exception) { emptyList() }
+                    }
+                    pearson = computePearson(histA.await(), histB.await())
+                }
+
+                val pearsonLine = pearson?.let {
+                    "Computed Pearson correlation (1w, hourly buckets): ${String.format(Locale.US, "%.3f", it)}"
+                } ?: "Pearson could not be computed (insufficient overlapping history) — estimate structurally."
+
+                val prompt = """
+                    You are an elite cross-market quant strategist for prediction markets. Research only — never advise order execution.
+
+                    MARKET A: "${anchor.title}" — implied ${anchor.probability}%, 24hΔ ${String.format(Locale.US, "%+.1f", anchor.delta)}pts, vol ${anchor.volume}, ends ${anchor.endsAt}
+                    MARKET B: "${other.title}" — implied ${other.probability}%, 24hΔ ${String.format(Locale.US, "%+.1f", other.delta)}pts, vol ${other.volume}, ends ${other.endsAt}
+                    $pearsonLine
+
+                    Output (dense, < 180 words, monospace-friendly):
+                    CORRELATION SCORE: a single number -1.00..+1.00 (use the computed Pearson if given, else your structural estimate) with one line on WHY (shared driver / causal channel / independence).
+                    SECOND-ORDER LINK: if A resolves YES, what happens to B's true probability?
+                    HEDGE STRUCTURE: how a researcher would think about pairing these two markets to isolate or neutralize the shared risk factor (conceptual, no order instructions).
+                    DIVERGENCE TRIGGER: the event that would break the correlation.
+                """.trimIndent()
+
+                val state = _uiState.value
+                val geminiKey = state.googleApiKey.takeIf { it.isNotBlank() && it != "MY_GEMINI_API_KEY" }
+                val xaiKey = state.xaiApiKey.takeIf { it.isNotBlank() && it != "MY_XAI_API_KEY" }
+                val openaiKey = state.openaiApiKey.takeIf { it.isNotBlank() && it != "MY_OPENAI_API_KEY" }
+
+                val analysis: String = when {
+                    geminiKey != null -> NetworkModule.geminiApi.generateContent(
+                        geminiKey,
+                        GenerateContentRequest(listOf(Content(listOf(Part(text = prompt)))))
+                    ).candidates?.firstOrNull()?.content?.parts?.firstOrNull()?.text
+                        ?: "Correlation engine returned no content."
+                    xaiKey != null -> NetworkModule.grokApi.getChatCompletions(
+                        "Bearer $xaiKey",
+                        com.example.network.GrokChatRequest(
+                            messages = listOf(
+                                com.example.network.GrokMessage("system", "You are an elite cross-market quant strategist."),
+                                com.example.network.GrokMessage("user", prompt)
+                            )
+                        )
+                    ).choices?.firstOrNull()?.message?.content ?: "Correlation engine returned no content."
+                    openaiKey != null -> NetworkModule.openAiApi.getChatCompletions(
+                        "Bearer $openaiKey",
+                        com.example.network.OpenAiChatRequest(
+                            messages = listOf(
+                                com.example.network.OpenAiMessage("system", "You are an elite cross-market quant strategist."),
+                                com.example.network.OpenAiMessage("user", prompt)
+                            )
+                        )
+                    ).choices?.firstOrNull()?.message?.content ?: "Correlation engine returned no content."
+                    else -> "No AI provider configured. Add a key in Settings to unlock the correlation engine." +
+                        (pearson?.let { "\n\nComputed Pearson (1w): ${String.format(Locale.US, "%.3f", it)}" } ?: "")
+                }
+
+                _uiState.value = _uiState.value.copy(correlationText = analysis, isCorrelating = false)
+                persistReport(
+                    type = "CORRELATION",
+                    marketId = anchor.id,
+                    title = "Correlation: ${anchor.title.take(30)} × ${other.title.take(30)}",
+                    content = analysis,
+                    provider = "auto"
+                )
+            } catch (e: Exception) {
+                _uiState.value = _uiState.value.copy(
+                    correlationText = "Correlation engine error: ${e.message}",
+                    isCorrelating = false
+                )
+            }
+        }
+    }
+
+    /** Pearson on hourly-bucketed aligned samples; null when overlap < 8h. */
+    private fun computePearson(
+        a: List<com.example.network.HistoryPoint>,
+        b: List<com.example.network.HistoryPoint>
+    ): Double? {
+        if (a.isEmpty() || b.isEmpty()) return null
+        fun bucket(points: List<com.example.network.HistoryPoint>): Map<Long, Double> =
+            points.groupBy { it.timeSec / 3600 }.mapValues { (_, v) -> v.map { it.price }.average() }
+        val ba = bucket(a)
+        val bb = bucket(b)
+        val keys = ba.keys.intersect(bb.keys).sorted()
+        if (keys.size < 8) return null
+        val xs = keys.map { ba.getValue(it) }
+        val ys = keys.map { bb.getValue(it) }
+        val mx = xs.average()
+        val my = ys.average()
+        var num = 0.0; var dx = 0.0; var dy = 0.0
+        for (i in keys.indices) {
+            val vx = xs[i] - mx
+            val vy = ys[i] - my
+            num += vx * vy; dx += vx * vx; dy += vy * vy
+        }
+        if (dx == 0.0 || dy == 0.0) return null
+        return (num / kotlin.math.sqrt(dx * dy)).coerceIn(-1.0, 1.0)
     }
 
     private fun triggerToastsForTopTrades(topTrades: List<TradeOpportunity>) {
@@ -928,6 +1398,30 @@ class TradeViewModel : ViewModel() {
                     openaiAnalysis = _uiState.value.openaiAnalysis + (oppId to openAiAnalysisText),
                     newsSentiment = _uiState.value.newsSentiment + (oppId to sentimentResult)
                 )
+
+                // Cache the multi-provider analysis for offline viewing.
+                persistReport(
+                    type = "ANALYSIS",
+                    marketId = oppId,
+                    title = "Analysis: ${opportunity.title.take(48)}",
+                    content = buildString {
+                        appendLine("MARKET: ${opportunity.title}")
+                        appendLine()
+                        appendLine("── MATH CONSENSUS (Gemini) ──")
+                        appendLine(analysisText)
+                        appendLine()
+                        appendLine("── GROK PREDICTIVE ──")
+                        appendLine(grokAnalysisText)
+                        appendLine()
+                        appendLine("── OPENAI STRATEGIST ──")
+                        appendLine(openAiAnalysisText)
+                        appendLine()
+                        appendLine("── NEWS SENTIMENT ──")
+                        appendLine("${sentimentResult.sentimentLabel} (${String.format(Locale.US, "%+.2f", sentimentResult.sentimentScore)})")
+                        appendLine(sentimentResult.reasoning)
+                    },
+                    provider = "multi"
+                )
             } catch (e: Exception) {
                 _uiState.value = _uiState.value.copy(
                     aiAnalysis = _uiState.value.aiAnalysis + (oppId to "Error compiling mathematical analysis: ${e.message}"),
@@ -943,13 +1437,23 @@ class TradeViewModel : ViewModel() {
         val title = event.title ?: "Unknown Event"
         val description = event.description ?: "Predictive high-frequency asset node."
         val endsAt = event.endDate ?: "2026-07-15T00:00:00Z"
-        
+
+        // Prefer REAL market data from the nested Gamma market when present;
+        // hash-derived values remain only as a fallback for offline/demo events.
+        val market = event.markets?.firstOrNull { it.active != false } ?: event.markets?.firstOrNull()
+        val realPrices = parseJsonDoubleArray(market?.outcomePrices)
+        val realProbability = realPrices.firstOrNull()?.let { (it * 100).toInt().coerceIn(1, 99) }
+        val realDelta = market?.oneDayPriceChange?.let { it * 100 } // pts
+        val realTokenId = parseJsonStringArray(market?.clobTokenIds).firstOrNull()
+        val realVolume = event.volume ?: market?.volumeNum
+        val realLiquidity = event.liquidity ?: market?.liquidityNum
+
         // Generate deterministic values based on title hashcode
         val hash = kotlin.math.abs(title.hashCode())
-        val probability = 15 + (hash % 81) // range 15% to 95%
+        val probability = realProbability ?: (15 + (hash % 81)) // range 15% to 95%
         val deltaSign = if (hash % 2 == 0) 1 else -1
         val deltaVal = (hash % 160) / 10.0 // e.g. 0.0 to 16.0
-        val delta = deltaSign * deltaVal
+        val delta = realDelta ?: (deltaSign * deltaVal)
         
         val scoreBase = 72.0 + (hash % 270) / 10.0 // 72.0 to 99.0
         val confidenceGrade = when {
@@ -961,17 +1465,28 @@ class TradeViewModel : ViewModel() {
         }
         val confidenceScore = scoreBase
         
-        val volumeInt = 60 + (hash % 1940) // 60k to 2000k
-        val volume = if (volumeInt >= 1000) {
-            String.format(Locale.US, "$%.1fM", volumeInt / 1000.0)
-        } else {
-            "$${volumeInt}k"
+        val volume = when {
+            realVolume != null && realVolume >= 1_000_000 ->
+                String.format(Locale.US, "$%.1fM", realVolume / 1_000_000.0)
+            realVolume != null && realVolume >= 1_000 ->
+                String.format(Locale.US, "$%.0fk", realVolume / 1_000.0)
+            realVolume != null -> String.format(Locale.US, "$%.0f", realVolume)
+            else -> {
+                val volumeInt = 60 + (hash % 1940) // fallback: 60k to 2000k
+                if (volumeInt >= 1000) String.format(Locale.US, "$%.1fM", volumeInt / 1000.0)
+                else "$${volumeInt}k"
+            }
         }
-        
-        val liquidity = when (hash % 3) {
-            0 -> "High"
-            1 -> "Med"
-            else -> "Thin"
+
+        val liquidity = when {
+            realLiquidity != null && realLiquidity >= 100_000 -> "High"
+            realLiquidity != null && realLiquidity >= 10_000 -> "Med"
+            realLiquidity != null -> "Thin"
+            else -> when (hash % 3) {
+                0 -> "High"
+                1 -> "Med"
+                else -> "Thin"
+            }
         }
         
         val hftSignal = if (hash % 4 == 0) "DETECTED" else "STABLE"
@@ -998,7 +1513,9 @@ class TradeViewModel : ViewModel() {
             confidenceGrade = confidenceGrade,
             volume = volume,
             liquidity = liquidity,
-            hftSignal = hftSignal
+            hftSignal = hftSignal,
+            tokenId = realTokenId,
+            conditionId = market?.conditionId
         )
     }
 

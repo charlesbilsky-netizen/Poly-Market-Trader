@@ -53,6 +53,9 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.ui.ToastNotification
 import com.example.network.TradeOpportunity
 import com.example.ui.TradeViewModel
+import com.example.ui.components.AlphaReportDialog
+import com.example.ui.components.DepthChart
+import com.example.ui.components.MarketHistoryChart
 import com.example.ui.MathNode
 import com.example.ui.theme.MyApplicationTheme
 import androidx.compose.ui.text.font.FontStyle
@@ -72,9 +75,26 @@ class MainActivity : ComponentActivity() {
   override fun onCreate(savedInstanceState: Bundle?) {
     super.onCreate(savedInstanceState)
     enableEdgeToEdge()
+
+    // Background market intelligence: daily digest + whale watch (read-only).
+    com.example.work.MarketIntel.schedule(applicationContext)
+    if (android.os.Build.VERSION.SDK_INT >= 33 &&
+      checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) !=
+      android.content.pm.PackageManager.PERMISSION_GRANTED
+    ) {
+      requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 100)
+    }
+
+    // A digest/whale notification can deep-link straight into its report.
+    val pendingTitle = intent?.getStringExtra(com.example.work.MarketIntel.EXTRA_REPORT_TITLE)
+    val pendingContent = intent?.getStringExtra(com.example.work.MarketIntel.EXTRA_REPORT_CONTENT)
+
     setContent {
       MyApplicationTheme {
-        MainScreen()
+        MainScreen(
+          pendingReportTitle = pendingTitle,
+          pendingReportContent = pendingContent
+        )
       }
     }
   }
@@ -101,14 +121,27 @@ object QuantTheme {
 }
 
 @Composable
-fun MainScreen() {
+fun MainScreen(
+  pendingReportTitle: String? = null,
+  pendingReportContent: String? = null
+) {
   val context = LocalContext.current
   val viewModel: TradeViewModel = viewModel()
   val uiState by viewModel.uiState.collectAsStateWithLifecycle()
+  val watchedIds by viewModel.watchedIds.collectAsStateWithLifecycle()
+  val watchlist by viewModel.watchlist.collectAsStateWithLifecycle()
+  val savedReports by viewModel.savedReports.collectAsStateWithLifecycle()
 
   var selectedTradeOpportunity by remember { mutableStateOf<TradeOpportunity?>(null) }
   var notificationMessage by remember { mutableStateOf<String?>(null) }
   var showSettingsModal by remember { mutableStateOf(false) }
+
+  // Open a report delivered via notification tap.
+  LaunchedEffect(pendingReportContent) {
+    if (!pendingReportContent.isNullOrBlank()) {
+      viewModel.presentReport(pendingReportTitle ?: "REPORT", pendingReportContent)
+    }
+  }
 
   // Set up the event flow listener for high density toast alerts
   LaunchedEffect(Unit) {
@@ -160,7 +193,7 @@ fun MainScreen() {
     Column(
       modifier = Modifier
         .fillMaxSize()
-        .windowInsetsPadding(WindowInsets.statusBars)
+        .safeDrawingPadding()
     ) {
       // 1. PolyTrader Title Header with Settings toggle
       HeaderBar(
@@ -178,9 +211,40 @@ fun MainScreen() {
           "signals" -> SignalsView(
             uiState = uiState,
             viewModel = viewModel,
+            watchedIds = watchedIds,
             onOpenUrl = { opportunity ->
               selectedTradeOpportunity = opportunity
             }
+          )
+          "watchlist" -> com.example.ui.components.WatchlistView(
+            watchlist = watchlist,
+            reports = savedReports,
+            onOpenMarket = { entity ->
+              selectedTradeOpportunity = TradeOpportunity(
+                id = entity.marketId,
+                title = entity.title,
+                description = "Watchlisted market — live research view.",
+                endsAt = "",
+                url = entity.url,
+                probability = entity.probability,
+                delta = 0.0,
+                confidenceScore = 0.0,
+                confidenceGrade = "—",
+                volume = entity.volume,
+                liquidity = "—",
+                hftSignal = "TRACKED",
+                category = entity.category,
+                tokenId = entity.tokenId,
+                conditionId = entity.conditionId
+              )
+            },
+            onOpenUrl = { url ->
+              val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+              context.startActivity(intent)
+            },
+            onRemove = { viewModel.removeFromWatchlist(it) },
+            onOpenReport = { report -> viewModel.presentReport(report.title.uppercase(), report.content) },
+            onDeleteReport = { viewModel.deleteReport(it) }
           )
           "portfolio" -> PortfolioView(
             uiState = uiState,
@@ -188,7 +252,8 @@ fun MainScreen() {
               val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
               context.startActivity(intent)
             },
-            onRefreshClob = { viewModel.fetchClobMarketsAndAnalyze() }
+            onRefreshClob = { viewModel.fetchClobMarketsAndAnalyze() },
+            onRefreshPortfolio = { viewModel.fetchPortfolioPositions() }
           )
           else -> {
             SignalsView(
@@ -209,24 +274,30 @@ fun MainScreen() {
       )
     }
 
-    // Modal secure MovoView (Immersive Trade execution panel)
+    // Modal Market Research Preview
     selectedTradeOpportunity?.let { opportunity ->
       MovoView(
         opportunity = opportunity,
         uiState = uiState,
         onDismiss = { selectedTradeOpportunity = null },
-        onExecute = { qty, price, outcome ->
-          viewModel.executeLimitOrder(opportunity, qty, price, outcome)
-          selectedTradeOpportunity = null
-        },
-        onGoToApi = {
-          showSettingsModal = true
-          selectedTradeOpportunity = null
-        },
         onOpenUrl = { url ->
           val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
           context.startActivity(intent)
-        }
+        },
+        onLoadResearch = { op -> viewModel.loadMarketResearch(op) },
+        onSelectRange = { op, range -> viewModel.setResearchRange(op, range) },
+        onCorrelate = { a, b -> viewModel.correlateMarkets(a, b) }
+      )
+    }
+
+    // Alpha Report / research library viewer
+    if (uiState.showAlphaDialog) {
+      AlphaReportDialog(
+        report = uiState.alphaReport,
+        isGenerating = uiState.isAlphaGenerating,
+        title = uiState.alphaReportTitle,
+        onDismiss = { viewModel.dismissAlphaDialog() },
+        onRegenerate = { viewModel.generateAlphaReport() }
       )
     }
 
@@ -234,8 +305,8 @@ fun MainScreen() {
     Box(
       modifier = Modifier
         .fillMaxWidth()
-        .align(Alignment.TopCenter)
-        .padding(top = 80.dp)
+        .align(Alignment.BottomCenter)
+        .padding(bottom = 100.dp)
     ) {
       Column(
         modifier = Modifier.fillMaxWidth(),
@@ -410,10 +481,16 @@ fun BottomNavBar(
     verticalAlignment = Alignment.CenterVertically
   ) {
     NavBarItem(
-      label = "Markets",
+      label = "Discover",
       icon = Icons.Default.Bolt,
       isActive = activeTab == "signals",
       onClick = { onTabSelected("signals") }
+    )
+    NavBarItem(
+      label = "Watchlist",
+      icon = Icons.Default.Star,
+      isActive = activeTab == "watchlist",
+      onClick = { onTabSelected("watchlist") }
     )
     NavBarItem(
       label = "Portfolio",
@@ -488,6 +565,28 @@ fun SettingsDialog(
   var showXaiApiKey by remember { mutableStateOf(false) }
   var showOpenaiApiKey by remember { mutableStateOf(false) }
 
+  // Bundled legal document viewer (Privacy Policy / Terms)
+  var legalDoc by remember { mutableStateOf<Pair<String, String>?>(null) }
+  legalDoc?.let { (title, body) ->
+    AlertDialog(
+      onDismissRequest = { legalDoc = null },
+      title = { Text(title, fontFamily = FontFamily.Monospace, fontSize = 16.sp, fontWeight = FontWeight.Bold) },
+      text = {
+        Text(
+          body,
+          fontSize = 12.sp,
+          lineHeight = 17.sp,
+          modifier = Modifier
+            .heightIn(max = 420.dp)
+            .verticalScroll(rememberScrollState())
+        )
+      },
+      confirmButton = {
+        Button(onClick = { legalDoc = null }) { Text("Close") }
+      }
+    )
+  }
+
   Dialog(
     onDismissRequest = onDismiss,
     properties = DialogProperties(usePlatformDefaultWidth = false)
@@ -526,9 +625,22 @@ fun SettingsDialog(
 
         HorizontalDivider(color = QuantTheme.border)
 
-        // Sandbox trading Switch
+        // Sandbox Mode Section
+        Text(
+          "Execution Mode",
+          color = QuantTheme.accentGreen,
+          fontSize = 14.sp,
+          fontWeight = FontWeight.Bold,
+          fontFamily = FontFamily.Monospace,
+          modifier = Modifier.padding(top = 8.dp)
+        )
+        
         Row(
-          modifier = Modifier.fillMaxWidth(),
+          modifier = Modifier
+            .fillMaxWidth()
+            .background(QuantTheme.background, RoundedCornerShape(12.dp))
+            .border(1.dp, QuantTheme.border, RoundedCornerShape(12.dp))
+            .padding(16.dp),
           horizontalArrangement = Arrangement.SpaceBetween,
           verticalAlignment = Alignment.CenterVertically
         ) {
@@ -548,217 +660,356 @@ fun SettingsDialog(
           )
         }
 
-        // Wallet address
-        OutlinedTextField(
-          value = walletAddress,
-          onValueChange = { walletAddress = it },
-          label = { Text("Your Wallet Address (Polygon)", color = QuantTheme.textMuted) },
-          placeholder = { Text("0x...", color = QuantTheme.textSubtle) },
-          textStyle = androidx.compose.ui.text.TextStyle(color = QuantTheme.textBody),
-          colors = OutlinedTextFieldDefaults.colors(
-            focusedBorderColor = QuantTheme.activeBorder,
-            unfocusedBorderColor = QuantTheme.border,
-            focusedLabelColor = QuantTheme.textPrimary,
-            unfocusedLabelColor = QuantTheme.textMuted
-          ),
-          modifier = Modifier.fillMaxWidth()
+        // Wallet & API Section (Only relevant if not demo mode... actually let's just group them)
+        Text(
+          "Polymarket Credentials",
+          color = QuantTheme.accentGreen,
+          fontSize = 14.sp,
+          fontWeight = FontWeight.Bold,
+          fontFamily = FontFamily.Monospace,
+          modifier = Modifier.padding(top = 16.dp)
         )
 
-        // API Access Key
-        OutlinedTextField(
-          value = apiKey,
-          onValueChange = { apiKey = it },
-          label = { Text("Polymarket CLOB API Key", color = QuantTheme.textMuted) },
-          textStyle = androidx.compose.ui.text.TextStyle(color = QuantTheme.textBody),
-          colors = OutlinedTextFieldDefaults.colors(
-            focusedBorderColor = QuantTheme.activeBorder,
-            unfocusedBorderColor = QuantTheme.border,
-            focusedLabelColor = QuantTheme.textPrimary,
-            unfocusedLabelColor = QuantTheme.textMuted
-          ),
-          modifier = Modifier.fillMaxWidth()
-        )
+        Column(
+          modifier = Modifier
+            .fillMaxWidth()
+            .background(QuantTheme.background, RoundedCornerShape(12.dp))
+            .border(1.dp, QuantTheme.border, RoundedCornerShape(12.dp))
+            .padding(16.dp),
+          verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+          // Wallet address
+          OutlinedTextField(
+            value = walletAddress,
+            onValueChange = { walletAddress = it },
+            label = { Text("Your Wallet Address (Polygon)", color = QuantTheme.textMuted) },
+            placeholder = { Text("0x...", color = QuantTheme.textSubtle) },
+            textStyle = androidx.compose.ui.text.TextStyle(color = QuantTheme.textBody),
+            colors = OutlinedTextFieldDefaults.colors(
+              focusedBorderColor = QuantTheme.activeBorder,
+              unfocusedBorderColor = QuantTheme.border,
+              focusedLabelColor = QuantTheme.textPrimary,
+              unfocusedLabelColor = QuantTheme.textMuted
+            ),
+            modifier = Modifier.fillMaxWidth()
+          )
 
-        // API Secret Key
-        OutlinedTextField(
-          value = apiSecret,
-          onValueChange = { apiSecret = it },
-          label = { Text("Polymarket CLOB Secret Key", color = QuantTheme.textMuted) },
-          textStyle = androidx.compose.ui.text.TextStyle(color = QuantTheme.textBody),
-          visualTransformation = if (showApiKeySecret) VisualTransformation.None else PasswordVisualTransformation(),
-          trailingIcon = {
-            IconButton(onClick = { showApiKeySecret = !showApiKeySecret }) {
-              Icon(
-                imageVector = if (showApiKeySecret) Icons.Default.Visibility else Icons.Default.VisibilityOff,
-                contentDescription = if (showApiKeySecret) "Hide" else "Show",
-                tint = QuantTheme.textMuted
-              )
-            }
-          },
-          colors = OutlinedTextFieldDefaults.colors(
-            focusedBorderColor = QuantTheme.activeBorder,
-            unfocusedBorderColor = QuantTheme.border,
-            focusedLabelColor = QuantTheme.textPrimary,
-            unfocusedLabelColor = QuantTheme.textMuted
-          ),
-          modifier = Modifier.fillMaxWidth()
-        )
+          // API Access Key
+          OutlinedTextField(
+            value = apiKey,
+            onValueChange = { apiKey = it },
+            label = { Text("Polymarket CLOB API Key", color = QuantTheme.textMuted) },
+            textStyle = androidx.compose.ui.text.TextStyle(color = QuantTheme.textBody),
+            colors = OutlinedTextFieldDefaults.colors(
+              focusedBorderColor = QuantTheme.activeBorder,
+              unfocusedBorderColor = QuantTheme.border,
+              focusedLabelColor = QuantTheme.textPrimary,
+              unfocusedLabelColor = QuantTheme.textMuted
+            ),
+            modifier = Modifier.fillMaxWidth()
+          )
 
-        // API Passphrase
-        OutlinedTextField(
-          value = apiPassphrase,
-          onValueChange = { apiPassphrase = it },
-          label = { Text("Polymarket CLOB Passphrase", color = QuantTheme.textMuted) },
-          textStyle = androidx.compose.ui.text.TextStyle(color = QuantTheme.textBody),
-          visualTransformation = if (showApiPassphrase) VisualTransformation.None else PasswordVisualTransformation(),
-          trailingIcon = {
-            IconButton(onClick = { showApiPassphrase = !showApiPassphrase }) {
-              Icon(
-                imageVector = if (showApiPassphrase) Icons.Default.Visibility else Icons.Default.VisibilityOff,
-                contentDescription = if (showApiPassphrase) "Hide" else "Show",
-                tint = QuantTheme.textMuted
-              )
-            }
-          },
-          colors = OutlinedTextFieldDefaults.colors(
-            focusedBorderColor = QuantTheme.activeBorder,
-            unfocusedBorderColor = QuantTheme.border,
-            focusedLabelColor = QuantTheme.textPrimary,
-            unfocusedLabelColor = QuantTheme.textMuted
-          ),
-          modifier = Modifier.fillMaxWidth()
-        )
+          // API Secret Key
+          OutlinedTextField(
+            value = apiSecret,
+            onValueChange = { apiSecret = it },
+            label = { Text("Polymarket CLOB Secret Key", color = QuantTheme.textMuted) },
+            textStyle = androidx.compose.ui.text.TextStyle(color = QuantTheme.textBody),
+            visualTransformation = if (showApiKeySecret) VisualTransformation.None else PasswordVisualTransformation(),
+            trailingIcon = {
+              IconButton(onClick = { showApiKeySecret = !showApiKeySecret }) {
+                Icon(
+                  imageVector = if (showApiKeySecret) Icons.Default.Visibility else Icons.Default.VisibilityOff,
+                  contentDescription = if (showApiKeySecret) "Hide" else "Show",
+                  tint = QuantTheme.textMuted
+                )
+              }
+            },
+            colors = OutlinedTextFieldDefaults.colors(
+              focusedBorderColor = QuantTheme.activeBorder,
+              unfocusedBorderColor = QuantTheme.border,
+              focusedLabelColor = QuantTheme.textPrimary,
+              unfocusedLabelColor = QuantTheme.textMuted
+            ),
+            modifier = Modifier.fillMaxWidth()
+          )
 
-        // Gemini AI Assistant key
-        OutlinedTextField(
-          value = googleApiKey,
-          onValueChange = { googleApiKey = it },
-          label = { Text("Google AI Assistant API Key", color = QuantTheme.textMuted) },
-          placeholder = { Text("AI Studio Gemini Key", color = QuantTheme.textSubtle) },
-          textStyle = androidx.compose.ui.text.TextStyle(color = QuantTheme.textBody),
-          visualTransformation = if (showGoogleApiKey) VisualTransformation.None else PasswordVisualTransformation(),
-          trailingIcon = {
-            IconButton(onClick = { showGoogleApiKey = !showGoogleApiKey }) {
-              Icon(
-                imageVector = if (showGoogleApiKey) Icons.Default.Visibility else Icons.Default.VisibilityOff,
-                contentDescription = if (showGoogleApiKey) "Hide" else "Show",
-                tint = QuantTheme.textMuted
-              )
-            }
-          },
-          colors = OutlinedTextFieldDefaults.colors(
-            focusedBorderColor = QuantTheme.activeBorder,
-            unfocusedBorderColor = QuantTheme.border,
-            focusedLabelColor = QuantTheme.textPrimary,
-            unfocusedLabelColor = QuantTheme.textMuted
-          ),
-          modifier = Modifier.fillMaxWidth()
-        )
-
-        // xAI Grok Key
-        OutlinedTextField(
-          value = xaiApiKey,
-          onValueChange = { xaiApiKey = it },
-          label = { Text("xAI Grok API Key", color = QuantTheme.textMuted) },
-          placeholder = { Text("xAI Grok Key", color = QuantTheme.textSubtle) },
-          textStyle = androidx.compose.ui.text.TextStyle(color = QuantTheme.textBody),
-          visualTransformation = if (showXaiApiKey) VisualTransformation.None else PasswordVisualTransformation(),
-          trailingIcon = {
-            IconButton(onClick = { showXaiApiKey = !showXaiApiKey }) {
-              Icon(
-                imageVector = if (showXaiApiKey) Icons.Default.Visibility else Icons.Default.VisibilityOff,
-                contentDescription = if (showXaiApiKey) "Hide" else "Show",
-                tint = QuantTheme.textMuted
-              )
-            }
-          },
-          colors = OutlinedTextFieldDefaults.colors(
-            focusedBorderColor = QuantTheme.activeBorder,
-            unfocusedBorderColor = QuantTheme.border,
-            focusedLabelColor = QuantTheme.textPrimary,
-            unfocusedLabelColor = QuantTheme.textMuted
-          ),
-          modifier = Modifier.fillMaxWidth().testTag("xai_api_key_input")
-        )
-
-        // OpenAI Key
-        OutlinedTextField(
-          value = openaiApiKey,
-          onValueChange = { openaiApiKey = it },
-          label = { Text("OpenAI API Key", color = QuantTheme.textMuted) },
-          placeholder = { Text("OpenAI Key", color = QuantTheme.textSubtle) },
-          textStyle = androidx.compose.ui.text.TextStyle(color = QuantTheme.textBody),
-          visualTransformation = if (showOpenaiApiKey) VisualTransformation.None else PasswordVisualTransformation(),
-          trailingIcon = {
-            IconButton(onClick = { showOpenaiApiKey = !showOpenaiApiKey }) {
-              Icon(
-                imageVector = if (showOpenaiApiKey) Icons.Default.Visibility else Icons.Default.VisibilityOff,
-                contentDescription = if (showOpenaiApiKey) "Hide" else "Show",
-                tint = QuantTheme.textMuted
-              )
-            }
-          },
-          colors = OutlinedTextFieldDefaults.colors(
-            focusedBorderColor = QuantTheme.activeBorder,
-            unfocusedBorderColor = QuantTheme.border,
-            focusedLabelColor = QuantTheme.textPrimary,
-            unfocusedLabelColor = QuantTheme.textMuted
-          ),
-          modifier = Modifier.fillMaxWidth().testTag("openai_api_key_input")
-        )
-
-        // AI suggestion guidelines (Custom Instructions)
-        OutlinedTextField(
-          value = customInstructions,
-          onValueChange = { customInstructions = it },
-          label = { Text("AI Trend Suggestions Rules", color = QuantTheme.textMuted) },
-          placeholder = { Text("e.g. Focus on political and crypto high stakes predictions.", color = QuantTheme.textSubtle) },
-          textStyle = androidx.compose.ui.text.TextStyle(color = QuantTheme.textBody),
-          maxLines = 4,
-          colors = OutlinedTextFieldDefaults.colors(
-            focusedBorderColor = QuantTheme.activeBorder,
-            unfocusedBorderColor = QuantTheme.border,
-            focusedLabelColor = QuantTheme.textPrimary,
-            unfocusedLabelColor = QuantTheme.textMuted
-          ),
-          modifier = Modifier.fillMaxWidth()
-        )
-
-        // Max trade size
-        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-          Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-            Text("Max Trade Size (USDC)", color = QuantTheme.textBody, fontSize = 14.sp, fontWeight = FontWeight.Bold)
-            Text("${maxPositionSize.toInt()} USDC", color = QuantTheme.textPrimary, fontSize = 14.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
-          }
-          Slider(
-            value = maxPositionSize,
-            onValueChange = { maxPositionSize = it },
-            valueRange = 10f..1000f,
-            colors = SliderDefaults.colors(
-              thumbColor = QuantTheme.textPrimary,
-              activeTrackColor = QuantTheme.accentBlue,
-              inactiveTrackColor = QuantTheme.surface
-            )
+          // API Passphrase
+          OutlinedTextField(
+            value = apiPassphrase,
+            onValueChange = { apiPassphrase = it },
+            label = { Text("Polymarket CLOB Passphrase", color = QuantTheme.textMuted) },
+            textStyle = androidx.compose.ui.text.TextStyle(color = QuantTheme.textBody),
+            visualTransformation = if (showApiPassphrase) VisualTransformation.None else PasswordVisualTransformation(),
+            trailingIcon = {
+              IconButton(onClick = { showApiPassphrase = !showApiPassphrase }) {
+                Icon(
+                  imageVector = if (showApiPassphrase) Icons.Default.Visibility else Icons.Default.VisibilityOff,
+                  contentDescription = if (showApiPassphrase) "Hide" else "Show",
+                  tint = QuantTheme.textMuted
+                )
+              }
+            },
+            colors = OutlinedTextFieldDefaults.colors(
+              focusedBorderColor = QuantTheme.activeBorder,
+              unfocusedBorderColor = QuantTheme.border,
+              focusedLabelColor = QuantTheme.textPrimary,
+              unfocusedLabelColor = QuantTheme.textMuted
+            ),
+            modifier = Modifier.fillMaxWidth()
           )
         }
 
-        // Risk multiplier
-        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-          Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-            Text("Risk Margin Tolerance", color = QuantTheme.textBody, fontSize = 14.sp, fontWeight = FontWeight.Bold)
-            Text(String.format("%.2f", riskTolerance), color = QuantTheme.textPrimary, fontSize = 14.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
-          }
-          Slider(
-            value = riskTolerance,
-            onValueChange = { riskTolerance = it },
-            valueRange = 0.05f..1.0f,
-            colors = SliderDefaults.colors(
-              thumbColor = QuantTheme.textPrimary,
-              activeTrackColor = QuantTheme.accentBlue,
-              inactiveTrackColor = QuantTheme.surface
-            )
+        Text(
+          "AI Providers",
+          color = QuantTheme.accentGreen,
+          fontSize = 14.sp,
+          fontWeight = FontWeight.Bold,
+          fontFamily = FontFamily.Monospace,
+          modifier = Modifier.padding(top = 16.dp)
+        )
+
+        Column(
+          modifier = Modifier
+            .fillMaxWidth()
+            .background(QuantTheme.background, RoundedCornerShape(12.dp))
+            .border(1.dp, QuantTheme.border, RoundedCornerShape(12.dp))
+            .padding(16.dp),
+          verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+          // Gemini AI Assistant key
+          OutlinedTextField(
+            value = googleApiKey,
+            onValueChange = { googleApiKey = it },
+            label = { Text("Google AI Assistant API Key", color = QuantTheme.textMuted) },
+            placeholder = { Text("AI Studio Gemini Key", color = QuantTheme.textSubtle) },
+            textStyle = androidx.compose.ui.text.TextStyle(color = QuantTheme.textBody),
+            visualTransformation = if (showGoogleApiKey) VisualTransformation.None else PasswordVisualTransformation(),
+            trailingIcon = {
+              IconButton(onClick = { showGoogleApiKey = !showGoogleApiKey }) {
+                Icon(
+                  imageVector = if (showGoogleApiKey) Icons.Default.Visibility else Icons.Default.VisibilityOff,
+                  contentDescription = if (showGoogleApiKey) "Hide" else "Show",
+                  tint = QuantTheme.textMuted
+                )
+              }
+            },
+            colors = OutlinedTextFieldDefaults.colors(
+              focusedBorderColor = QuantTheme.activeBorder,
+              unfocusedBorderColor = QuantTheme.border,
+              focusedLabelColor = QuantTheme.textPrimary,
+              unfocusedLabelColor = QuantTheme.textMuted
+            ),
+            modifier = Modifier.fillMaxWidth()
+          )
+
+          // xAI Grok Key
+          OutlinedTextField(
+            value = xaiApiKey,
+            onValueChange = { xaiApiKey = it },
+            label = { Text("xAI Grok API Key", color = QuantTheme.textMuted) },
+            placeholder = { Text("xAI Grok Key", color = QuantTheme.textSubtle) },
+            textStyle = androidx.compose.ui.text.TextStyle(color = QuantTheme.textBody),
+            visualTransformation = if (showXaiApiKey) VisualTransformation.None else PasswordVisualTransformation(),
+            trailingIcon = {
+              IconButton(onClick = { showXaiApiKey = !showXaiApiKey }) {
+                Icon(
+                  imageVector = if (showXaiApiKey) Icons.Default.Visibility else Icons.Default.VisibilityOff,
+                  contentDescription = if (showXaiApiKey) "Hide" else "Show",
+                  tint = QuantTheme.textMuted
+                )
+              }
+            },
+            colors = OutlinedTextFieldDefaults.colors(
+              focusedBorderColor = QuantTheme.activeBorder,
+              unfocusedBorderColor = QuantTheme.border,
+              focusedLabelColor = QuantTheme.textPrimary,
+              unfocusedLabelColor = QuantTheme.textMuted
+            ),
+            modifier = Modifier.fillMaxWidth().testTag("xai_api_key_input")
+          )
+
+          // OpenAI Key
+          OutlinedTextField(
+            value = openaiApiKey,
+            onValueChange = { openaiApiKey = it },
+            label = { Text("OpenAI API Key", color = QuantTheme.textMuted) },
+            placeholder = { Text("OpenAI Key", color = QuantTheme.textSubtle) },
+            textStyle = androidx.compose.ui.text.TextStyle(color = QuantTheme.textBody),
+            visualTransformation = if (showOpenaiApiKey) VisualTransformation.None else PasswordVisualTransformation(),
+            trailingIcon = {
+              IconButton(onClick = { showOpenaiApiKey = !showOpenaiApiKey }) {
+                Icon(
+                  imageVector = if (showOpenaiApiKey) Icons.Default.Visibility else Icons.Default.VisibilityOff,
+                  contentDescription = if (showOpenaiApiKey) "Hide" else "Show",
+                  tint = QuantTheme.textMuted
+                )
+              }
+            },
+            colors = OutlinedTextFieldDefaults.colors(
+              focusedBorderColor = QuantTheme.activeBorder,
+              unfocusedBorderColor = QuantTheme.border,
+              focusedLabelColor = QuantTheme.textPrimary,
+              unfocusedLabelColor = QuantTheme.textMuted
+            ),
+            modifier = Modifier.fillMaxWidth().testTag("openai_api_key_input")
           )
         }
+
+        Text(
+          "AI Agent Instructions",
+          color = QuantTheme.accentGreen,
+          fontSize = 14.sp,
+          fontWeight = FontWeight.Bold,
+          fontFamily = FontFamily.Monospace,
+          modifier = Modifier.padding(top = 16.dp)
+        )
+
+        Column(
+          modifier = Modifier
+            .fillMaxWidth()
+            .background(QuantTheme.background, RoundedCornerShape(12.dp))
+            .border(1.dp, QuantTheme.border, RoundedCornerShape(12.dp))
+            .padding(16.dp),
+          verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+          // AI suggestion guidelines (Custom Instructions)
+          OutlinedTextField(
+            value = customInstructions,
+            onValueChange = { customInstructions = it },
+            label = { Text("Custom AI Research Prompts", color = QuantTheme.textMuted) },
+            placeholder = { Text("e.g. Focus on political and crypto high stakes predictions.", color = QuantTheme.textSubtle) },
+            textStyle = androidx.compose.ui.text.TextStyle(color = QuantTheme.textBody),
+            minLines = 3,
+            maxLines = 6,
+            colors = OutlinedTextFieldDefaults.colors(
+              focusedBorderColor = QuantTheme.activeBorder,
+              unfocusedBorderColor = QuantTheme.border,
+              focusedLabelColor = QuantTheme.textPrimary,
+              unfocusedLabelColor = QuantTheme.textMuted
+            ),
+            modifier = Modifier.fillMaxWidth()
+          )
+
+          Text("Templates:", color = QuantTheme.textMuted, fontSize = 12.sp, modifier = Modifier.padding(top = 4.dp))
+          
+          androidx.compose.foundation.lazy.LazyRow(
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            modifier = Modifier.fillMaxWidth()
+          ) {
+            item {
+              Box(modifier = Modifier.clip(RoundedCornerShape(8.dp)).background(QuantTheme.surface).border(1.dp, QuantTheme.border, RoundedCornerShape(8.dp)).clickable {
+                customInstructions = "Act as an expert Polymarket trader. Focus strictly on political and high-stakes macro markets. Flag if volume is below $50k. Always extract implied probabilities."
+              }.padding(horizontal = 12.dp, vertical = 6.dp)) {
+                Text("Political Focus", color = QuantTheme.textPrimary, fontSize = 12.sp)
+              }
+            }
+            item {
+              Box(modifier = Modifier.clip(RoundedCornerShape(8.dp)).background(QuantTheme.surface).border(1.dp, QuantTheme.border, RoundedCornerShape(8.dp)).clickable {
+                customInstructions = "Act as a contrarian crypto trader. Weigh recent news sentiment heavily over historical base rates. Look for overreactions."
+              }.padding(horizontal = 12.dp, vertical = 6.dp)) {
+                Text("Contrarian Crypto", color = QuantTheme.textPrimary, fontSize = 12.sp)
+              }
+            }
+            item {
+              Box(modifier = Modifier.clip(RoundedCornerShape(8.dp)).background(QuantTheme.surface).border(1.dp, QuantTheme.border, RoundedCornerShape(8.dp)).clickable {
+                customInstructions = "Act as a quantitative analyst. Prioritize markets with tight spreads and high liquidity. Summarize the risk/reward ratio mathematically."
+              }.padding(horizontal = 12.dp, vertical = 6.dp)) {
+                Text("Quant Mode", color = QuantTheme.textPrimary, fontSize = 12.sp)
+              }
+            }
+          }
+        }
+
+        Text(
+          "System Settings",
+          color = QuantTheme.accentGreen,
+          fontSize = 14.sp,
+          fontWeight = FontWeight.Bold,
+          fontFamily = FontFamily.Monospace,
+          modifier = Modifier.padding(top = 16.dp)
+        )
+
+        Column(
+          modifier = Modifier
+            .fillMaxWidth()
+            .background(QuantTheme.background, RoundedCornerShape(12.dp))
+            .border(1.dp, QuantTheme.border, RoundedCornerShape(12.dp))
+            .padding(16.dp),
+          verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+          // Max trade size
+          Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+              Text("Max Trade Size (USDC)", color = QuantTheme.textBody, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+              Text("${maxPositionSize.toInt()} USDC", color = QuantTheme.textPrimary, fontSize = 14.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
+            }
+            Slider(
+              value = maxPositionSize,
+              onValueChange = { maxPositionSize = it },
+              valueRange = 10f..1000f,
+              colors = SliderDefaults.colors(
+                thumbColor = QuantTheme.textPrimary,
+                activeTrackColor = QuantTheme.accentBlue,
+                inactiveTrackColor = QuantTheme.surface
+              )
+            )
+          }
+
+          // Risk multiplier
+          Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+              Text("Risk Margin Tolerance", color = QuantTheme.textBody, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+              Text(String.format("%.2f", riskTolerance), color = QuantTheme.textPrimary, fontSize = 14.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
+            }
+            Slider(
+              value = riskTolerance,
+              onValueChange = { riskTolerance = it },
+              valueRange = 0.05f..1.0f,
+              colors = SliderDefaults.colors(
+                thumbColor = QuantTheme.textPrimary,
+                activeTrackColor = QuantTheme.accentBlue,
+                inactiveTrackColor = QuantTheme.surface
+              )
+            )
+          }
+        }
+
+        // Legal — bundled Privacy Policy & Terms (offline, Play-policy friendly)
+        HorizontalDivider(color = QuantTheme.border)
+        Text(
+          "LEGAL",
+          color = QuantTheme.textMuted,
+          fontSize = 12.sp,
+          fontWeight = FontWeight.Bold,
+          fontFamily = FontFamily.Monospace,
+          letterSpacing = 0.5.sp
+        )
+        Row(
+          modifier = Modifier.fillMaxWidth(),
+          horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+          OutlinedButton(
+            onClick = { legalDoc = com.example.ui.LegalTexts.PRIVACY_TITLE to com.example.ui.LegalTexts.PRIVACY },
+            modifier = Modifier.weight(1f),
+            shape = RoundedCornerShape(8.dp)
+          ) {
+            Text("Privacy Policy", fontSize = 12.sp)
+          }
+          OutlinedButton(
+            onClick = { legalDoc = com.example.ui.LegalTexts.TERMS_TITLE to com.example.ui.LegalTexts.TERMS },
+            modifier = Modifier.weight(1f),
+            shape = RoundedCornerShape(8.dp)
+          ) {
+            Text("Terms & Conditions", fontSize = 12.sp)
+          }
+        }
+        Text(
+          "PolyTrader is research-only: no trading execution, no fund custody, no financial advice. Not affiliated with Polymarket.",
+          color = QuantTheme.textMuted,
+          fontSize = 10.sp,
+          lineHeight = 14.sp
+        )
 
         Spacer(modifier = Modifier.height(8.dp))
 
@@ -826,7 +1077,8 @@ fun SettingsDialog(
 fun SignalsView(
   uiState: com.example.ui.TradeUiState,
   viewModel: TradeViewModel,
-  onOpenUrl: (TradeOpportunity) -> Unit
+  onOpenUrl: (TradeOpportunity) -> Unit,
+  watchedIds: Set<String> = emptySet()
 ) {
   val allOpportunities = (uiState.topOpportunities + uiState.opportunities).distinctBy { it.id }
 
@@ -858,15 +1110,35 @@ fun SignalsView(
           )
         }
 
-        Button(
-          onClick = { viewModel.fetchMarkets() },
-          colors = ButtonDefaults.buttonColors(containerColor = QuantTheme.accentBlue),
-          shape = RoundedCornerShape(10.dp),
-          contentPadding = PaddingValues(horizontal = 16.dp, vertical = 10.dp)
-        ) {
-          Icon(Icons.Default.Refresh, contentDescription = "Scan", modifier = Modifier.size(18.dp))
-          Spacer(modifier = Modifier.width(6.dp))
-          Text("Scan", fontSize = 14.sp, fontWeight = FontWeight.Bold)
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+          // Elite forecaster deep scan over the live market universe
+          Button(
+            onClick = { viewModel.generateAlphaReport() },
+            colors = ButtonDefaults.buttonColors(containerColor = QuantTheme.accentGreen),
+            shape = RoundedCornerShape(10.dp),
+            contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp),
+            enabled = !uiState.isAlphaGenerating
+          ) {
+            Icon(
+              Icons.Default.AutoAwesome,
+              contentDescription = "Alpha scan",
+              modifier = Modifier.size(18.dp),
+              tint = Color(0xFF111315)
+            )
+            Spacer(modifier = Modifier.width(6.dp))
+            Text("Alpha", fontSize = 14.sp, fontWeight = FontWeight.Bold, color = Color(0xFF111315))
+          }
+
+          Button(
+            onClick = { viewModel.fetchMarkets() },
+            colors = ButtonDefaults.buttonColors(containerColor = QuantTheme.accentBlue),
+            shape = RoundedCornerShape(10.dp),
+            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 10.dp)
+          ) {
+            Icon(Icons.Default.Refresh, contentDescription = "Scan", modifier = Modifier.size(18.dp))
+            Spacer(modifier = Modifier.width(6.dp))
+            Text("Scan", fontSize = 14.sp, fontWeight = FontWeight.Bold)
+          }
         }
       }
     }
@@ -876,52 +1148,29 @@ fun SignalsView(
       var searchQuery by remember { mutableStateOf("") }
       val context = LocalContext.current
       
-      Card(
-        colors = CardDefaults.cardColors(containerColor = QuantTheme.surface),
-        modifier = Modifier.fillMaxWidth().testTag("news_search_card"),
-        shape = RoundedCornerShape(12.dp),
-        border = BorderStroke(1.dp, QuantTheme.border)
-      ) {
-        Column(modifier = Modifier.padding(16.dp)) {
-          Row(verticalAlignment = Alignment.CenterVertically) {
-            Icon(
-              imageVector = Icons.Default.Search,
-              contentDescription = "Search news",
-              tint = QuantTheme.accentGreen,
-              modifier = Modifier.size(18.dp)
-            )
-            Spacer(modifier = Modifier.width(8.dp))
-            Text(
-              "AI NEWS SEARCH & OVERREACTION ENGINE",
-              style = MaterialTheme.typography.labelLarge,
-              fontWeight = FontWeight.Bold,
-              color = QuantTheme.textPrimary
-            )
-          }
-          
-          Spacer(modifier = Modifier.height(4.dp))
-          Text(
-            "Compile and synthesize global news overreactions to inject real-time dynamic trades.",
-            style = MaterialTheme.typography.bodySmall,
-            color = QuantTheme.textMuted
-          )
-          
-          Spacer(modifier = Modifier.height(12.dp))
-          
+      Column(modifier = Modifier.fillMaxWidth()) {
           OutlinedTextField(
             value = searchQuery,
             onValueChange = { searchQuery = it },
-            placeholder = { Text("Search topic, e.g. 'Nvidia delays', 'Fed rates'...", color = QuantTheme.textMuted, fontSize = 13.sp) },
+            placeholder = { Text("Search news topics (e.g. 'Nvidia', 'Fed rates')", color = QuantTheme.textMuted, fontSize = 14.sp) },
             textStyle = androidx.compose.ui.text.TextStyle(color = QuantTheme.textBody, fontSize = 14.sp),
             singleLine = true,
             colors = OutlinedTextFieldDefaults.colors(
               focusedBorderColor = QuantTheme.accentGreen,
               unfocusedBorderColor = QuantTheme.border,
-              focusedContainerColor = QuantTheme.background,
-              unfocusedContainerColor = QuantTheme.background
+              focusedContainerColor = QuantTheme.surface,
+              unfocusedContainerColor = QuantTheme.surface
             ),
             modifier = Modifier.fillMaxWidth().testTag("news_search_input"),
-            shape = RoundedCornerShape(8.dp),
+            shape = RoundedCornerShape(12.dp),
+            leadingIcon = {
+               Icon(
+                 imageVector = Icons.Default.Search,
+                 contentDescription = "Search news",
+                 tint = QuantTheme.accentGreen,
+                 modifier = Modifier.size(20.dp)
+               )
+            },
             trailingIcon = {
               if (searchQuery.isNotEmpty()) {
                 IconButton(onClick = { searchQuery = "" }) {
@@ -932,7 +1181,17 @@ fun SignalsView(
                   )
                 }
               }
-            }
+            },
+            keyboardActions = androidx.compose.foundation.text.KeyboardActions(
+              onDone = {
+                  if (searchQuery.trim().isEmpty()) {
+                    Toast.makeText(context, "Please enter a news topic.", Toast.LENGTH_SHORT).show()
+                  } else {
+                    viewModel.generateNewsTradeOpportunities(searchQuery.trim())
+                  }
+              }
+            ),
+            keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(imeAction = androidx.compose.ui.text.input.ImeAction.Search)
           )
           
           Spacer(modifier = Modifier.height(12.dp))
@@ -950,6 +1209,7 @@ fun SignalsView(
                   .border(1.dp, QuantTheme.border, RoundedCornerShape(16.dp))
                   .clickable {
                     searchQuery = tag
+                    viewModel.generateNewsTradeOpportunities(tag)
                   }
                   .padding(horizontal = 12.dp, vertical = 6.dp)
               ) {
@@ -957,34 +1217,6 @@ fun SignalsView(
               }
             }
           }
-          
-          Spacer(modifier = Modifier.height(16.dp))
-          
-          Button(
-            onClick = {
-              if (searchQuery.trim().isEmpty()) {
-                Toast.makeText(context, "Please enter a news topic or select a tag.", Toast.LENGTH_SHORT).show()
-              } else {
-                viewModel.generateNewsTradeOpportunities(searchQuery.trim())
-              }
-            },
-            colors = ButtonDefaults.buttonColors(containerColor = QuantTheme.accentGreen),
-            modifier = Modifier.fillMaxWidth().testTag("news_search_button"),
-            shape = RoundedCornerShape(8.dp),
-            enabled = !uiState.isLoading,
-            contentPadding = PaddingValues(vertical = 12.dp)
-          ) {
-            if (uiState.isLoading) {
-              CircularProgressIndicator(color = QuantTheme.background, modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
-              Spacer(modifier = Modifier.width(8.dp))
-              Text("Synthesizing News...", color = Color(0xFF111315), fontSize = 14.sp, fontWeight = FontWeight.Bold)
-            } else {
-              Icon(Icons.Default.Bolt, contentDescription = "Flash", modifier = Modifier.size(18.dp), tint = Color(0xFF111315))
-              Spacer(modifier = Modifier.width(6.dp))
-              Text("Inject AI Overreaction Trades", color = Color(0xFF111315), fontSize = 14.sp, fontWeight = FontWeight.Bold)
-            }
-          }
-        }
       }
     }
 
@@ -1035,7 +1267,9 @@ fun SignalsView(
           quantResult = uiState.quantAnalysis[op.id],
           newsSentimentResult = uiState.newsSentiment[op.id],
           onAnalyze = { viewModel.analyzeMarket(op) },
-          onTrade = { onOpenUrl(op) }
+          onTrade = { onOpenUrl(op) },
+          isWatched = op.id in watchedIds,
+          onToggleWatch = { viewModel.toggleWatchlist(op) }
         )
       }
     }
@@ -1238,7 +1472,7 @@ fun TopGridOpportunityCard(
           }
           Spacer(modifier = Modifier.height(2.dp))
           Text(
-            if (isHighest) "HFT SIGNAL: DETECTED" else "Vol: ${opportunity.volume} • Liq: ${opportunity.liquidity}",
+            if (isHighest) "AI Confidence: High" else "Vol: ${opportunity.volume} • Liq: ${opportunity.liquidity}",
             color = QuantTheme.textMuted,
             fontSize = 12.sp,
             fontFamily = FontFamily.Monospace
@@ -1278,7 +1512,7 @@ fun TopGridOpportunityCard(
               .padding(horizontal = 8.dp, vertical = 4.dp)
           ) {
             Text(
-              text = if (isHighest) "ULTRA: ${String.format(Locale.US, "%.1f", opportunity.confidenceScore)}" else "${String.format(Locale.US, "%.1f", opportunity.confidenceScore)} (${opportunity.confidenceGrade})",
+              text = if (isHighest) "CONFIDENCE: ${String.format(Locale.US, "%.1f", opportunity.confidenceScore)}" else "${String.format(Locale.US, "%.1f", opportunity.confidenceScore)} (${opportunity.confidenceGrade})",
               color = if (isHighest) Color(0xFF002F66) else QuantTheme.textPrimary,
               fontSize = 12.sp,
               fontWeight = FontWeight.Bold
@@ -1368,7 +1602,7 @@ fun TopGridOpportunityCard(
         if (aiAnalysis == null) {
           Box(
             modifier = Modifier
-              .weight(0.45f)
+              .weight(0.4f)
               .height(44.dp)
               .clip(RoundedCornerShape(8.dp))
               .border(1.dp, QuantTheme.border, RoundedCornerShape(8.dp))
@@ -1380,18 +1614,17 @@ fun TopGridOpportunityCard(
               horizontalArrangement = Arrangement.Center
             ) {
               Icon(
-                Icons.Default.Hub,
+                Icons.Default.AutoAwesome,
                 contentDescription = null,
                 tint = QuantTheme.textPrimary,
-                modifier = Modifier.size(14.dp)
+                modifier = Modifier.size(16.dp)
               )
               Spacer(modifier = Modifier.width(6.dp))
               Text(
-                "CONSENSUS",
+                "AI Research",
                 color = QuantTheme.textPrimary,
                 fontSize = 13.sp,
-                fontWeight = FontWeight.Bold,
-                fontFamily = FontFamily.Monospace
+                fontWeight = FontWeight.SemiBold
               )
             }
           }
@@ -1399,10 +1632,10 @@ fun TopGridOpportunityCard(
 
         Box(
           modifier = Modifier
-            .weight(if (aiAnalysis == null) 0.35f else 0.5f)
-            .height(48.dp)
+            .weight(if (aiAnalysis == null) 0.6f else 1f)
+            .height(44.dp)
             .clip(RoundedCornerShape(8.dp))
-            .background(QuantTheme.accentGreen)
+            .background(Color(0xFF0035FF)) // Polymarket Blue
             .clickable { onTrade() },
           contentAlignment = Alignment.Center
         ) {
@@ -1411,36 +1644,19 @@ fun TopGridOpportunityCard(
             horizontalArrangement = Arrangement.Center
           ) {
             Icon(
-              Icons.AutoMirrored.Filled.TrendingUp,
+              Icons.Default.OpenInNew,
               contentDescription = null,
-              tint = Color(0xFF002F66),
-              modifier = Modifier.size(20.dp)
+              tint = Color.White,
+              modifier = Modifier.size(18.dp)
             )
             Spacer(modifier = Modifier.width(6.dp))
             Text(
-              "EXECUTE",
-              color = Color(0xFF002F66),
-              fontSize = 13.sp,
-              fontWeight = FontWeight.ExtraBold,
-              fontFamily = FontFamily.Monospace
+              "View on Polymarket.com",
+              color = Color.White,
+              fontSize = 14.sp,
+              fontWeight = FontWeight.Bold
             )
           }
-        }
-
-        Box(
-          modifier = Modifier
-            .weight(if (aiAnalysis == null) 0.35f else 0.5f)
-            .height(48.dp)
-            .clip(RoundedCornerShape(8.dp))
-            .background(Color(0xFF0035FF))
-            .clickable { onTrade() },
-          contentAlignment = Alignment.Center
-        ) {
-           Row(verticalAlignment = Alignment.CenterVertically) {
-             Icon(Icons.Default.Language, contentDescription = null, tint = Color.White, modifier = Modifier.size(16.dp))
-             Spacer(modifier = Modifier.width(4.dp))
-             Text("QUICK", color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Bold)
-           }
         }
       }
     }
@@ -1456,7 +1672,9 @@ fun StandardOpportunityCard(
   quantResult: com.example.ui.QuantAnalysisResult?,
   newsSentimentResult: NewsSentimentResult?,
   onAnalyze: () -> Unit,
-  onTrade: () -> Unit
+  onTrade: () -> Unit,
+  isWatched: Boolean = false,
+  onToggleWatch: (() -> Unit)? = null
 ) {
   Card(
     modifier = Modifier
@@ -1507,6 +1725,17 @@ fun StandardOpportunityCard(
             fontWeight = FontWeight.Bold,
             fontFamily = FontFamily.Monospace
           )
+          if (onToggleWatch != null) {
+            Spacer(modifier = Modifier.width(4.dp))
+            IconButton(onClick = onToggleWatch, modifier = Modifier.size(28.dp)) {
+              Icon(
+                imageVector = if (isWatched) Icons.Default.Star else Icons.Default.StarBorder,
+                contentDescription = if (isWatched) "Remove from watchlist" else "Add to watchlist",
+                tint = if (isWatched) QuantTheme.accentGreen else QuantTheme.textMuted,
+                modifier = Modifier.size(18.dp)
+              )
+            }
+          }
         }
       }
 
@@ -1600,7 +1829,7 @@ fun StandardOpportunityCard(
         if (aiAnalysis == null) {
           Box(
             modifier = Modifier
-              .weight(0.45f)
+              .weight(0.4f)
               .height(44.dp)
               .clip(RoundedCornerShape(8.dp))
               .border(1.dp, QuantTheme.border, RoundedCornerShape(8.dp))
@@ -1612,18 +1841,17 @@ fun StandardOpportunityCard(
               horizontalArrangement = Arrangement.Center
             ) {
               Icon(
-                Icons.Default.Hub,
+                Icons.Default.AutoAwesome,
                 contentDescription = null,
                 tint = QuantTheme.textPrimary,
-                modifier = Modifier.size(14.dp)
+                modifier = Modifier.size(16.dp)
               )
               Spacer(modifier = Modifier.width(6.dp))
               Text(
-                "MATH ANALYSIS",
+                "AI Research",
                 color = QuantTheme.textPrimary,
                 fontSize = 13.sp,
-                fontWeight = FontWeight.Bold,
-                fontFamily = FontFamily.Monospace
+                fontWeight = FontWeight.SemiBold
               )
             }
           }
@@ -1631,10 +1859,10 @@ fun StandardOpportunityCard(
 
         Box(
           modifier = Modifier
-            .weight(if (aiAnalysis == null) 0.35f else 0.5f)
-            .height(48.dp)
+            .weight(if (aiAnalysis == null) 0.6f else 1f)
+            .height(44.dp)
             .clip(RoundedCornerShape(8.dp))
-            .background(QuantTheme.accentGreen)
+            .background(Color(0xFF0035FF)) // Polymarket Blue
             .clickable { onTrade() },
           contentAlignment = Alignment.Center
         ) {
@@ -1643,36 +1871,19 @@ fun StandardOpportunityCard(
             horizontalArrangement = Arrangement.Center
           ) {
             Icon(
-              Icons.AutoMirrored.Filled.TrendingUp,
+              Icons.Default.OpenInNew,
               contentDescription = null,
-              tint = Color(0xFF002F66),
-              modifier = Modifier.size(20.dp)
+              tint = Color.White,
+              modifier = Modifier.size(18.dp)
             )
             Spacer(modifier = Modifier.width(6.dp))
             Text(
-              "EXECUTE",
-              color = Color(0xFF002F66),
-              fontSize = 13.sp,
-              fontWeight = FontWeight.ExtraBold,
-              fontFamily = FontFamily.Monospace
+              "View on Polymarket.com",
+              color = Color.White,
+              fontSize = 14.sp,
+              fontWeight = FontWeight.Bold
             )
           }
-        }
-
-        Box(
-          modifier = Modifier
-            .weight(if (aiAnalysis == null) 0.35f else 0.5f)
-            .height(48.dp)
-            .clip(RoundedCornerShape(8.dp))
-            .background(Color(0xFF0035FF))
-            .clickable { onTrade() },
-          contentAlignment = Alignment.Center
-        ) {
-           Row(verticalAlignment = Alignment.CenterVertically) {
-             Icon(Icons.Default.Language, contentDescription = null, tint = Color.White, modifier = Modifier.size(16.dp))
-             Spacer(modifier = Modifier.width(4.dp))
-             Text("QUICK", color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Bold)
-           }
         }
       }
     }
@@ -1683,7 +1894,8 @@ fun StandardOpportunityCard(
 fun PortfolioView(
   uiState: com.example.ui.TradeUiState,
   onOpenUrl: (String) -> Unit,
-  onRefreshClob: () -> Unit
+  onRefreshClob: () -> Unit,
+  onRefreshPortfolio: () -> Unit
 ) {
   LazyColumn(
     modifier = Modifier
@@ -1738,6 +1950,40 @@ fun PortfolioView(
         }
         Icon(Icons.Default.ChevronRight, contentDescription = "Open", tint = QuantTheme.textPrimary)
       }
+    }
+
+    // Read-Only Wallet Portfolio
+    item {
+      Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+      ) {
+        Text("WALLET POSITIONS (READ-ONLY)", color = QuantTheme.textPrimary, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+        IconButton(
+          onClick = { onRefreshPortfolio() },
+          modifier = Modifier.size(24.dp)
+        ) {
+          Icon(Icons.Default.Refresh, contentDescription = "Sync Portfolio", tint = QuantTheme.textPrimary, modifier = Modifier.size(16.dp))
+        }
+      }
+    }
+
+    if (uiState.portfolioPositions.isEmpty()) {
+        item {
+            Text("No positions fetched. Tap refresh or add wallet in Settings.", color = QuantTheme.textMuted, fontSize = 13.sp)
+        }
+    }
+
+    items(uiState.portfolioPositions) { pos ->
+      PortfolioPositionRow(
+        title = pos.title,
+        position = pos.position,
+        size = pos.size,
+        entry = pos.entry,
+        current = pos.current,
+        profit = pos.profit
+      )
     }
 
     // Real-time CLOB Opportunities (Replaces static history)
@@ -2505,9 +2751,7 @@ fun ApiSettingsView(
 
 @Composable
 fun TradeExecutionSummaryCard(
-  opportunity: TradeOpportunity,
-  selectedOutcome: String,
-  onOutcomeSelected: (String) -> Unit
+  opportunity: TradeOpportunity
 ) {
   val yesPrice = opportunity.probability / 100.0
   val noPrice = (100 - opportunity.probability) / 100.0
@@ -2527,7 +2771,7 @@ fun TradeExecutionSummaryCard(
         verticalAlignment = Alignment.CenterVertically
       ) {
         Text(
-          text = "SIMPLIFIED TRADE SUMMARY",
+          text = "CURRENT MARKET PRICES",
           color = QuantTheme.textMuted,
           fontSize = 11.sp,
           fontWeight = FontWeight.Bold,
@@ -2543,7 +2787,7 @@ fun TradeExecutionSummaryCard(
             .padding(horizontal = 8.dp, vertical = 4.dp)
         ) {
           Text(
-            text = "PREDICTED OUTCOME: $predicted ($predictedProb%)",
+            text = "AI PREDICTED: $predicted ($predictedProb%)",
             color = if (predicted == "YES") QuantTheme.accentGreen else QuantTheme.accentRed,
             fontSize = 11.sp,
             fontWeight = FontWeight.Bold
@@ -2562,18 +2806,16 @@ fun TradeExecutionSummaryCard(
           modifier = Modifier
             .weight(1f)
             .clip(RoundedCornerShape(10.dp))
-            .background(if (selectedOutcome == "YES") QuantTheme.accentGreen.copy(alpha = 0.12f) else QuantTheme.surface)
+            .background(QuantTheme.surface)
             .border(
-              width = 1.5.dp,
-              color = if (selectedOutcome == "YES") QuantTheme.accentGreen else QuantTheme.border,
+              width = 1.dp,
+              color = QuantTheme.border,
               shape = RoundedCornerShape(10.dp)
             )
-            .testTag("predict_yes_box")
-            .clickable { onOutcomeSelected("YES") }
             .padding(12.dp)
         ) {
           Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.fillMaxWidth()) {
-            Text("Predict YES", color = if (selectedOutcome == "YES") QuantTheme.accentGreen else QuantTheme.textBody, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+            Text("YES", color = QuantTheme.accentGreen, fontSize = 12.sp, fontWeight = FontWeight.Bold)
             Spacer(modifier = Modifier.height(4.dp))
             Text(String.format(Locale.US, "$%.2f USDC", yesPrice), color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Black, fontFamily = FontFamily.Monospace)
           }
@@ -2584,18 +2826,16 @@ fun TradeExecutionSummaryCard(
           modifier = Modifier
             .weight(1f)
             .clip(RoundedCornerShape(10.dp))
-            .background(if (selectedOutcome == "NO") QuantTheme.accentRed.copy(alpha = 0.12f) else QuantTheme.surface)
+            .background(QuantTheme.surface)
             .border(
-              width = 1.5.dp,
-              color = if (selectedOutcome == "NO") QuantTheme.accentRed else QuantTheme.border,
+              width = 1.dp,
+              color = QuantTheme.border,
               shape = RoundedCornerShape(10.dp)
             )
-            .testTag("predict_no_box")
-            .clickable { onOutcomeSelected("NO") }
             .padding(12.dp)
         ) {
           Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.fillMaxWidth()) {
-            Text("Predict NO", color = if (selectedOutcome == "NO") QuantTheme.accentRed else QuantTheme.textBody, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+            Text("NO", color = QuantTheme.accentRed, fontSize = 12.sp, fontWeight = FontWeight.Bold)
             Spacer(modifier = Modifier.height(4.dp))
             Text(String.format(Locale.US, "$%.2f USDC", noPrice), color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Black, fontFamily = FontFamily.Monospace)
           }
@@ -2610,27 +2850,15 @@ fun MovoView(
   opportunity: TradeOpportunity,
   uiState: com.example.ui.TradeUiState,
   onDismiss: () -> Unit,
-  onExecute: (Double, Double, String) -> Unit,
-  onGoToApi: () -> Unit,
-  onOpenUrl: (String) -> Unit
+  onOpenUrl: (String) -> Unit,
+  onLoadResearch: (TradeOpportunity) -> Unit = {},
+  onSelectRange: (TradeOpportunity, String) -> Unit = { _, _ -> },
+  onCorrelate: (TradeOpportunity, TradeOpportunity) -> Unit = { _, _ -> }
 ) {
-  var quantityStr by remember { mutableStateOf("100") }
-  var priceStr by remember { mutableStateOf(String.format(Locale.US, "%.2f", opportunity.probability / 100.0)) }
-  var selectedOutcome by remember { mutableStateOf("YES") }
   var showAdvancedAnalytics by remember { mutableStateOf(false) }
 
-  val quantity = quantityStr.toDoubleOrNull() ?: 0.0
-  val price = priceStr.toDoubleOrNull() ?: 0.0
-  val totalCost = quantity * price
-
-  val isConfigured = uiState.polymarketWallet.isNotBlank() && 
-                     uiState.polymarketApiKey.isNotBlank() &&
-                     uiState.polymarketApiSecret.isNotBlank()
-
-  // Bot execution state
-  var botState by remember { mutableStateOf("IDLE") } // IDLE, CONNECTING, SIGNING, ROUTING, SUCCESS
-  var botLogText by remember { mutableStateOf("") }
-  val coroutineScope = rememberCoroutineScope()
+  // Pull real CLOB market data (prices-history + order book) on open.
+  LaunchedEffect(opportunity.id) { onLoadResearch(opportunity) }
 
   // Generate simulated chart prices if quant prices are empty
   val quantResult = uiState.quantAnalysis[opportunity.id]
@@ -2688,7 +2916,7 @@ fun MovoView(
               modifier = Modifier.size(24.dp)
             )
             Text(
-              "MOVO QUANTUM PREVIEW",
+              "MARKET RESEARCH PREVIEW",
               color = QuantTheme.textPrimary,
               fontSize = 18.sp,
               fontWeight = FontWeight.ExtraBold,
@@ -2761,19 +2989,221 @@ fun MovoView(
 
         // 2.5 Clean, Simplified Trade Execution Summary Card
         TradeExecutionSummaryCard(
-          opportunity = opportunity,
-          selectedOutcome = selectedOutcome,
-          onOutcomeSelected = { outcome ->
-            selectedOutcome = outcome
-            // Automatically sync the price input with the selected outcome's price
-            val outcomePrice = if (outcome == "YES") {
-              opportunity.probability / 100.0
-            } else {
-              (100 - opportunity.probability) / 100.0
-            }
-            priceStr = String.format(Locale.US, "%.2f", outcomePrice)
-          }
+          opportunity = opportunity
         )
+
+        // 2.6 LIVE MARKET STRUCTURE — real CLOB prices-history + order book depth
+        Column(
+          modifier = Modifier
+            .fillMaxWidth()
+            .background(Color(0xFF131720), RoundedCornerShape(12.dp))
+            .border(1.dp, QuantTheme.border, RoundedCornerShape(12.dp))
+            .padding(14.dp),
+          verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+          Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+          ) {
+            Text(
+              "PROBABILITY HISTORY — LIVE CLOB DATA",
+              color = QuantTheme.textMuted,
+              fontSize = 12.sp,
+              fontWeight = FontWeight.Bold,
+              letterSpacing = 0.5.sp,
+              fontFamily = FontFamily.Monospace
+            )
+            if (opportunity.id in uiState.researchLoadingIds) {
+              CircularProgressIndicator(
+                color = QuantTheme.accentGreen,
+                strokeWidth = 2.dp,
+                modifier = Modifier.size(14.dp)
+              )
+            }
+          }
+
+          MarketHistoryChart(
+            points = uiState.researchHistory[opportunity.id] ?: emptyList()
+          )
+
+          // Range selector chips
+          Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
+          ) {
+            listOf("1h", "6h", "1d", "1w", "1m", "max").forEach { range ->
+              val selected = uiState.researchRange == range
+              Box(
+                modifier = Modifier
+                  .clip(RoundedCornerShape(8.dp))
+                  .background(if (selected) QuantTheme.accentBlue else QuantTheme.navButtonBg)
+                  .border(
+                    1.dp,
+                    if (selected) QuantTheme.activeBorder else QuantTheme.border,
+                    RoundedCornerShape(8.dp)
+                  )
+                  .clickable { onSelectRange(opportunity, range) }
+                  .padding(horizontal = 10.dp, vertical = 5.dp)
+              ) {
+                Text(
+                  range.uppercase(),
+                  color = if (selected) QuantTheme.textPrimary else QuantTheme.textSubtle,
+                  fontSize = 10.sp,
+                  fontWeight = FontWeight.Bold,
+                  fontFamily = FontFamily.Monospace
+                )
+              }
+            }
+          }
+
+          val book = uiState.researchBooks[opportunity.id]
+          if (book != null && (book.bids.isNotEmpty() || book.asks.isNotEmpty())) {
+            HorizontalDivider(color = QuantTheme.border, thickness = 0.5.dp)
+            Text(
+              "ORDER BOOK DEPTH — CUMULATIVE",
+              color = QuantTheme.textMuted,
+              fontSize = 12.sp,
+              fontWeight = FontWeight.Bold,
+              letterSpacing = 0.5.sp,
+              fontFamily = FontFamily.Monospace
+            )
+            DepthChart(book = book)
+          }
+        }
+
+        // 2.7 WHALE FEED — large fills from the public Data API
+        val whales = uiState.researchWhales[opportunity.id].orEmpty()
+        if (whales.isNotEmpty()) {
+          Column(
+            modifier = Modifier
+              .fillMaxWidth()
+              .background(Color(0xFF131720), RoundedCornerShape(12.dp))
+              .border(1.dp, QuantTheme.border, RoundedCornerShape(12.dp))
+              .padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp)
+          ) {
+            Text(
+              "🐋 WHALE FEED — FILLS ≥ $1K NOTIONAL",
+              color = QuantTheme.textMuted,
+              fontSize = 12.sp,
+              fontWeight = FontWeight.Bold,
+              letterSpacing = 0.5.sp,
+              fontFamily = FontFamily.Monospace
+            )
+            whales.take(6).forEach { trade ->
+              Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+              ) {
+                Text(
+                  "${trade.side ?: "?"} ${trade.outcome ?: ""}",
+                  color = if (trade.side == "BUY") QuantTheme.accentGreen else QuantTheme.accentRed,
+                  fontSize = 11.sp,
+                  fontWeight = FontWeight.Bold,
+                  fontFamily = FontFamily.Monospace
+                )
+                Text(
+                  String.format(Locale.US, "$%,.0f @ %.1f¢", trade.notionalUsd, (trade.price ?: 0.0) * 100),
+                  color = QuantTheme.textBody,
+                  fontSize = 11.sp,
+                  fontFamily = FontFamily.Monospace
+                )
+                Text(
+                  trade.traderLabel.take(14),
+                  color = QuantTheme.textMuted,
+                  fontSize = 10.sp,
+                  fontFamily = FontFamily.Monospace,
+                  maxLines = 1,
+                  overflow = TextOverflow.Ellipsis
+                )
+              }
+            }
+          }
+        }
+
+        // 2.8 EVENT CORRELATION MATRIX — pair this market against another
+        val correlationCandidates = (uiState.topOpportunities + uiState.opportunities)
+          .filter { it.id != opportunity.id }
+          .distinctBy { it.id }
+          .take(4)
+        if (correlationCandidates.isNotEmpty()) {
+          Column(
+            modifier = Modifier
+              .fillMaxWidth()
+              .background(Color(0xFF131720), RoundedCornerShape(12.dp))
+              .border(1.dp, QuantTheme.border, RoundedCornerShape(12.dp))
+              .padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+          ) {
+            Row(
+              modifier = Modifier.fillMaxWidth(),
+              horizontalArrangement = Arrangement.SpaceBetween,
+              verticalAlignment = Alignment.CenterVertically
+            ) {
+              Text(
+                "EVENT CORRELATION MATRIX",
+                color = QuantTheme.textMuted,
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Bold,
+                letterSpacing = 0.5.sp,
+                fontFamily = FontFamily.Monospace
+              )
+              if (uiState.isCorrelating) {
+                CircularProgressIndicator(
+                  color = QuantTheme.accentGreen,
+                  strokeWidth = 2.dp,
+                  modifier = Modifier.size(14.dp)
+                )
+              }
+            }
+            Text(
+              "Pearson on 1w CLOB histories + AI hedge read. Pair with:",
+              color = QuantTheme.textSubtle,
+              fontSize = 11.sp
+            )
+            correlationCandidates.forEach { other ->
+              Box(
+                modifier = Modifier
+                  .fillMaxWidth()
+                  .clip(RoundedCornerShape(8.dp))
+                  .background(QuantTheme.navButtonBg)
+                  .border(1.dp, QuantTheme.border, RoundedCornerShape(8.dp))
+                  .clickable(enabled = !uiState.isCorrelating) { onCorrelate(opportunity, other) }
+                  .padding(horizontal = 10.dp, vertical = 8.dp)
+              ) {
+                Text(
+                  "⇄ ${other.title}",
+                  color = QuantTheme.textSubtle,
+                  fontSize = 11.sp,
+                  fontFamily = FontFamily.Monospace,
+                  maxLines = 1,
+                  overflow = TextOverflow.Ellipsis
+                )
+              }
+            }
+            if (uiState.correlationText != null) {
+              HorizontalDivider(color = QuantTheme.border, thickness = 0.5.dp)
+              uiState.correlationLabel?.let {
+                Text(
+                  "vs ${it.uppercase()}",
+                  color = QuantTheme.accentGreen,
+                  fontSize = 10.sp,
+                  fontWeight = FontWeight.Bold,
+                  fontFamily = FontFamily.Monospace
+                )
+              }
+              Text(
+                uiState.correlationText ?: "",
+                color = QuantTheme.textBody,
+                fontSize = 12.sp,
+                lineHeight = 17.sp,
+                fontFamily = FontFamily.Monospace
+              )
+            }
+          }
+        }
 
         // Collapsible Advanced Analytics Section Toggle
         Column(
@@ -3028,263 +3458,21 @@ fun MovoView(
           shape = RoundedCornerShape(12.dp)
         ) {
           Icon(
-            Icons.Default.Language,
+            Icons.Default.OpenInNew,
             contentDescription = null,
             tint = Color.White,
             modifier = Modifier.size(20.dp)
           )
           Spacer(modifier = Modifier.width(8.dp))
           Text(
-            "🌐 QUICK TRADE ON POLYMARKET.COM (EXTERNAL LINK)",
+            "VIEW ON POLYMARKET.COM",
             fontWeight = FontWeight.ExtraBold,
-            fontSize = 13.sp,
+            fontSize = 14.sp,
             color = Color.White,
             letterSpacing = 0.5.sp
           )
         }
 
-        HorizontalDivider(color = QuantTheme.border, thickness = 0.5.dp)
-
-        // 6. INTERNAL QUANT BOT EXECUTION CONTROL PANEL
-        Column(
-          modifier = Modifier
-            .fillMaxWidth()
-            .background(Color(0xFF131720), RoundedCornerShape(12.dp))
-            .border(1.dp, QuantTheme.border, RoundedCornerShape(12.dp))
-            .padding(14.dp),
-          verticalArrangement = Arrangement.spacedBy(14.dp)
-        ) {
-          Row(
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(6.dp)
-          ) {
-            Icon(Icons.Default.SmartButton, contentDescription = null, tint = QuantTheme.textPrimary, modifier = Modifier.size(18.dp))
-            Text(
-              "LOCAL BOT TRADING CONTROLS",
-              color = QuantTheme.textPrimary,
-              fontSize = 13.sp,
-              fontWeight = FontWeight.Bold,
-              letterSpacing = 0.5.sp,
-              fontFamily = FontFamily.Monospace
-            )
-          }
-
-          // YES / NO toggles
-          Row(
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-            modifier = Modifier.fillMaxWidth()
-          ) {
-            Box(
-              modifier = Modifier
-                .weight(1f)
-                .clip(RoundedCornerShape(8.dp))
-                .background(if (selectedOutcome == "YES") QuantTheme.accentGreen.copy(alpha = 0.2f) else QuantTheme.surface)
-                .border(1.dp, if (selectedOutcome == "YES") QuantTheme.accentGreen else Color.Transparent, RoundedCornerShape(8.dp))
-                .clickable { selectedOutcome = "YES" }
-                .padding(vertical = 12.dp),
-              contentAlignment = Alignment.Center
-            ) {
-              Text("YES POSITION", color = if (selectedOutcome == "YES") QuantTheme.accentGreen else QuantTheme.textSubtle, fontSize = 14.sp, fontWeight = FontWeight.Bold)
-            }
-            Box(
-              modifier = Modifier
-                .weight(1f)
-                .clip(RoundedCornerShape(8.dp))
-                .background(if (selectedOutcome == "NO") QuantTheme.accentRed.copy(alpha = 0.2f) else QuantTheme.surface)
-                .border(1.dp, if (selectedOutcome == "NO") QuantTheme.accentRed else Color.Transparent, RoundedCornerShape(8.dp))
-                .clickable { selectedOutcome = "NO" }
-                .padding(vertical = 12.dp),
-              contentAlignment = Alignment.Center
-            ) {
-              Text("NO POSITION", color = if (selectedOutcome == "NO") QuantTheme.accentRed else QuantTheme.textSubtle, fontSize = 14.sp, fontWeight = FontWeight.Bold)
-            }
-          }
-
-          // Limit Price & Quantity text inputs
-          Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(12.dp)
-          ) {
-            OutlinedTextField(
-              value = priceStr,
-              onValueChange = { priceStr = it },
-              label = { Text("Limit Price (USDC)", color = QuantTheme.textMuted, fontSize = 12.sp) },
-              textStyle = androidx.compose.ui.text.TextStyle(color = QuantTheme.textBody, fontSize = 14.sp, fontFamily = FontFamily.Monospace),
-              colors = OutlinedTextFieldDefaults.colors(
-                focusedBorderColor = QuantTheme.activeBorder,
-                unfocusedBorderColor = QuantTheme.border
-              ),
-              modifier = Modifier.weight(1f)
-            )
-
-            OutlinedTextField(
-              value = quantityStr,
-              onValueChange = { quantityStr = it },
-              label = { Text("Contracts Amount", color = QuantTheme.textMuted, fontSize = 12.sp) },
-              textStyle = androidx.compose.ui.text.TextStyle(color = QuantTheme.textBody, fontSize = 14.sp, fontFamily = FontFamily.Monospace),
-              colors = OutlinedTextFieldDefaults.colors(
-                focusedBorderColor = QuantTheme.activeBorder,
-                unfocusedBorderColor = QuantTheme.border
-              ),
-              modifier = Modifier.weight(1f)
-            )
-          }
-
-          // Expected cost and sandbox toggle
-          Row(
-            modifier = Modifier
-              .fillMaxWidth()
-              .background(QuantTheme.activeSurface, RoundedCornerShape(8.dp))
-              .border(1.dp, QuantTheme.border, RoundedCornerShape(8.dp))
-              .padding(12.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-          ) {
-            Column {
-              Text("CALCULATED TOTAL COST", color = QuantTheme.textMuted, fontSize = 11.sp, fontWeight = FontWeight.Bold)
-              Text(String.format(Locale.US, "$%.2f USDC", totalCost), color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.ExtraBold, fontFamily = FontFamily.Monospace)
-              
-              Text(
-                "Your Balance: ${String.format(Locale.US, "%.2f", uiState.usdcBalance)} USDC",
-                color = if (totalCost > uiState.usdcBalance) QuantTheme.accentRed else QuantTheme.textSubtle,
-                fontSize = 11.sp,
-                fontStyle = FontStyle.Italic
-              )
-            }
-            Box(
-              modifier = Modifier
-                .background(QuantTheme.navButtonBg, RoundedCornerShape(4.dp))
-                .padding(horizontal = 8.dp, vertical = 6.dp)
-            ) {
-              Text(
-                if (uiState.isTestnet) "OFFLINE SANDBOX MODE" else "POLYGON MAINNET ROUTE",
-                color = if (uiState.isTestnet) QuantTheme.textSubtle else QuantTheme.accentGreen,
-                fontSize = 10.sp,
-                fontWeight = FontWeight.Bold,
-                fontFamily = FontFamily.Monospace
-              )
-            }
-          }
-
-          if (totalCost > uiState.usdcBalance) {
-            Row(
-              modifier = Modifier
-                .fillMaxWidth()
-                .background(QuantTheme.alertDarkRed, RoundedCornerShape(8.dp))
-                .padding(10.dp),
-              verticalAlignment = Alignment.CenterVertically,
-              horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-              Icon(Icons.Default.Warning, contentDescription = null, tint = QuantTheme.alertLightRed, modifier = Modifier.size(16.dp))
-              Text("Insufficient USDC balance for this trade size.", color = QuantTheme.alertLightRed, fontSize = 12.sp)
-            }
-          }
-
-          // Credentials Warning/Sync message
-          if (!isConfigured) {
-            Row(
-              modifier = Modifier
-                .fillMaxWidth()
-                .background(QuantTheme.alertDarkRed, RoundedCornerShape(8.dp))
-                .border(1.dp, QuantTheme.alertLightRed, RoundedCornerShape(8.dp))
-                .clickable { onGoToApi() }
-                .padding(12.dp),
-              horizontalArrangement = Arrangement.spacedBy(10.dp),
-              verticalAlignment = Alignment.CenterVertically
-            ) {
-              Icon(Icons.Default.Warning, contentDescription = "Warning", tint = QuantTheme.alertLightRed, modifier = Modifier.size(18.dp))
-              Column(modifier = Modifier.weight(1f)) {
-                Text("API credentials not synced. Simulated order mode is active.", color = QuantTheme.alertLightRed, fontSize = 13.sp, fontWeight = FontWeight.Bold)
-                Text("Tap here to configure real wallets and API keys in Settings.", color = QuantTheme.textSubtle, fontSize = 11.sp)
-              }
-            }
-          }
-
-          // Bot execution animation and logs
-          if (botState != "IDLE") {
-            Column(
-              modifier = Modifier
-                .fillMaxWidth()
-                .background(Color(0xFF070B10), RoundedCornerShape(8.dp))
-                .padding(10.dp),
-              verticalArrangement = Arrangement.spacedBy(6.dp)
-            ) {
-              Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-              ) {
-                if (botState != "SUCCESS") {
-                  CircularProgressIndicator(modifier = Modifier.size(14.dp), strokeWidth = 1.5.dp, color = QuantTheme.accentGreen)
-                } else {
-                  Icon(Icons.Default.CheckCircle, contentDescription = "Success", tint = QuantTheme.accentGreen, modifier = Modifier.size(16.dp))
-                }
-                Text(
-                  text = "BOT PROCESS STATE: $botState",
-                  color = if (botState == "SUCCESS") QuantTheme.accentGreen else QuantTheme.textPrimary,
-                  fontSize = 11.sp,
-                  fontWeight = FontWeight.Bold,
-                  fontFamily = FontFamily.Monospace
-                )
-              }
-              Text(
-                text = botLogText,
-                color = QuantTheme.textBody,
-                fontSize = 12.sp,
-                fontFamily = FontFamily.Monospace
-              )
-            }
-          }
-
-          // Execution Button
-          Button(
-            onClick = {
-              if (quantity > 0.0 && price > 0.0 && totalCost <= uiState.usdcBalance) {
-                coroutineScope.launch {
-                  botState = "CONNECTING"
-                  botLogText = "Establishing connection with Polygon node RPC routers..."
-                  delay(1000)
-
-                  botState = "SIGNING"
-                  botLogText = "Packaging order payloads and validating EIP-712 cryptographic signature..."
-                  delay(1000)
-
-                  botState = "ROUTING"
-                  botLogText = "Broadcasting limit buy order of ${quantity.toInt()} YES contracts at $price USDC to CLOB..."
-                  delay(1200)
-
-                  botState = "SUCCESS"
-                  botLogText = "Order matched perfectly! Successfully filled ${quantity.toInt()} contracts of YES at $price USDC."
-                  delay(1500)
-
-                  onExecute(quantity, price, selectedOutcome)
-                  botState = "IDLE"
-                  botLogText = ""
-                }
-              }
-            },
-            colors = ButtonDefaults.buttonColors(containerColor = if (isConfigured) QuantTheme.accentGreen else Color(0xFF00C853)),
-            enabled = quantity > 0.0 && price > 0.0 && botState == "IDLE",
-            modifier = Modifier
-              .fillMaxWidth()
-              .height(52.dp),
-            shape = RoundedCornerShape(12.dp)
-          ) {
-            Icon(
-              Icons.Default.SmartToy,
-              contentDescription = "Bot",
-              tint = Color(0xFF002F66),
-              modifier = Modifier.size(20.dp)
-            )
-            Spacer(modifier = Modifier.width(8.dp))
-            Text(
-              "🤖 EXECUTE IN INTERNAL QUANT TRADING BOT",
-              fontWeight = FontWeight.Bold,
-              fontSize = 13.sp,
-              color = Color(0xFF002F66),
-              letterSpacing = 0.5.sp
-            )
-          }
-        }
       }
     }
   }

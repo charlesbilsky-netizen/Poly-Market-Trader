@@ -16,3 +16,7 @@
 local.properties
 .env
 debug.keystore
+
+# Release signing — never commit
+my-upload-key.jks
+*.jks
