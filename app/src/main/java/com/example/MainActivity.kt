@@ -565,6 +565,28 @@ fun SettingsDialog(
   var showXaiApiKey by remember { mutableStateOf(false) }
   var showOpenaiApiKey by remember { mutableStateOf(false) }
 
+  // Bundled legal document viewer (Privacy Policy / Terms)
+  var legalDoc by remember { mutableStateOf<Pair<String, String>?>(null) }
+  legalDoc?.let { (title, body) ->
+    AlertDialog(
+      onDismissRequest = { legalDoc = null },
+      title = { Text(title, fontFamily = FontFamily.Monospace, fontSize = 16.sp, fontWeight = FontWeight.Bold) },
+      text = {
+        Text(
+          body,
+          fontSize = 12.sp,
+          lineHeight = 17.sp,
+          modifier = Modifier
+            .heightIn(max = 420.dp)
+            .verticalScroll(rememberScrollState())
+        )
+      },
+      confirmButton = {
+        Button(onClick = { legalDoc = null }) { Text("Close") }
+      }
+    )
+  }
+
   Dialog(
     onDismissRequest = onDismiss,
     properties = DialogProperties(usePlatformDefaultWidth = false)
@@ -952,6 +974,42 @@ fun SettingsDialog(
             )
           }
         }
+
+        // Legal — bundled Privacy Policy & Terms (offline, Play-policy friendly)
+        HorizontalDivider(color = QuantTheme.border)
+        Text(
+          "LEGAL",
+          color = QuantTheme.textMuted,
+          fontSize = 12.sp,
+          fontWeight = FontWeight.Bold,
+          fontFamily = FontFamily.Monospace,
+          letterSpacing = 0.5.sp
+        )
+        Row(
+          modifier = Modifier.fillMaxWidth(),
+          horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+          OutlinedButton(
+            onClick = { legalDoc = com.example.ui.LegalTexts.PRIVACY_TITLE to com.example.ui.LegalTexts.PRIVACY },
+            modifier = Modifier.weight(1f),
+            shape = RoundedCornerShape(8.dp)
+          ) {
+            Text("Privacy Policy", fontSize = 12.sp)
+          }
+          OutlinedButton(
+            onClick = { legalDoc = com.example.ui.LegalTexts.TERMS_TITLE to com.example.ui.LegalTexts.TERMS },
+            modifier = Modifier.weight(1f),
+            shape = RoundedCornerShape(8.dp)
+          ) {
+            Text("Terms & Conditions", fontSize = 12.sp)
+          }
+        }
+        Text(
+          "PolyTrader is research-only: no trading execution, no fund custody, no financial advice. Not affiliated with Polymarket.",
+          color = QuantTheme.textMuted,
+          fontSize = 10.sp,
+          lineHeight = 14.sp
+        )
 
         Spacer(modifier = Modifier.height(8.dp))
 
