@@ -1,21 +1,44 @@
-<div align="center">
-<img width="1200" height="475" alt="GHBanner" src="https://ai.google.dev/static/site-assets/images/share-ais-513315318.png" />
-</div>
+# PolyTrader — Polymarket Research Companion
 
-# Run and deploy your AI Studio app
+A research-first Android companion app for [Polymarket](https://polymarket.com).
+**No trading happens in the app** — every "Open in Polymarket & Trade" button
+deep-links to the exact market page on polymarket.com. The app's value is
+discovery, live analytics, and AI-powered research.
 
-This contains everything you need to run your app locally.
+## Features
 
-View your app in AI Studio: https://ai.studio/apps/f4f8f3f4-3fb4-4390-aed1-efdd5848d579
+- **Discover** — trending / new / ending-soon / resolved rails, category chips,
+  debounced full-text search, watchlist stars.
+- **Market detail** — live probability via the CLOB WebSocket, animated
+  probability bar, historical probability chart (1H → ALL ranges), outcome
+  comparison with American odds, order-book liquidity depth view, recent
+  trades feed, related markets.
+- **AI research** (bring your own key, all optional):
+  - **X (Twitter) sentiment** via xAI Grok's native `x_search` tool — score,
+    label, key quotes, source citations. Falls back to Gemini with Google
+    Search grounding ("web sentiment") or OpenAI (labeled no-live-data).
+  - **Probability assessment** — AI fair-value estimate, bull/bear cases,
+    verdict vs market price.
+- **Scenario calculator** — edge, expected value, win/lose payoff and Kelly
+  fraction for a hypothetical stake (pure research math, no orders).
+- **Portfolio (read-only)** — paste any public proxy-wallet address to see
+  positions, P&L and redemption status via Polymarket's public Data API.
+  No keys, no signing, no custody.
 
-## Run Locally
+All Polymarket data comes from the public, keyless Gamma / CLOB-read / Data
+APIs. See `docs/ARCHITECTURE.md` and `docs/API_REFERENCE.md`.
 
-**Prerequisites:**  [Android Studio](https://developer.android.com/studio)
+## Build
 
+Prerequisites: Android SDK (platform 36), JDK 17+, Gradle 8.13+ (AGP 8.13).
 
-1. Open Android Studio
-2. Select **Open** and choose the directory containing this project
-3. Allow Android Studio to fix any incompatibilities as it imports the project.
-4. Create a file named `.env` in the project directory and set `GEMINI_API_KEY` in that file to your Gemini API key (see `.env.example` for an example)
-5. Remove this line from the app's `build.gradle.kts` file: `signingConfig = signingConfigs.getByName("debugConfig")`
-6. Run the app on an emulator or physical device
+1. Optionally create `.env` with default AI keys (see `.env.example`) — users
+   can also paste keys in-app under Settings.
+2. `gradle :app:assembleDebug`
+3. Install `app/build/outputs/apk/debug/app-debug.apk`.
+
+## Stack
+
+Jetpack Compose + Material 3 (custom "Meridian" dark-first theme, IBM Plex +
+Suez One), Kotlin coroutines/Flow, Retrofit + Moshi, OkHttp WebSocket, Room
+(watchlist), DataStore (settings), Coil. Manual DI — no Hilt.

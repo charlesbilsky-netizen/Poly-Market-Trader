@@ -1,3 +1,4 @@
 <resources>
     <string name="app_name">PolyTrader</string>
+    <string name="app_tagline">Polymarket Research Companion</string>
 </resources>
