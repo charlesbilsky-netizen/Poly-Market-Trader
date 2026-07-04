@@ -17,8 +17,8 @@ android {
     applicationId = "com.polytrader.app"
     minSdk = 24
     targetSdk = 35
-    versionCode = 4
-    versionName = "3.0"
+    versionCode = 5
+    versionName = "3.1"
     multiDexEnabled = true
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
