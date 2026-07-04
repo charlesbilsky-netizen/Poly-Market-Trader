@@ -38,7 +38,9 @@ jobs:
         run: |
           APK=app/build/outputs/apk/release/app-release.apk
           ls -la "$APK"
-          "$ANDROID_HOME"/build-tools/*/apksigner verify --print-certs "$APK"
+          # Runners ship several build-tools versions — pick the newest one.
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          "$BT/apksigner" verify --print-certs "$APK"
 
       - name: Rename artifact
         run: cp app/build/outputs/apk/release/app-release.apk PolyTrader.apk
