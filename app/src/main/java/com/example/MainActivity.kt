@@ -1651,7 +1651,7 @@ fun TopGridOpportunityCard(
             )
             Spacer(modifier = Modifier.width(6.dp))
             Text(
-              "Open in Polymarket",
+              "View on Polymarket.com",
               color = Color.White,
               fontSize = 14.sp,
               fontWeight = FontWeight.Bold
@@ -1878,7 +1878,7 @@ fun StandardOpportunityCard(
             )
             Spacer(modifier = Modifier.width(6.dp))
             Text(
-              "Open in Polymarket",
+              "View on Polymarket.com",
               color = Color.White,
               fontSize = 14.sp,
               fontWeight = FontWeight.Bold
@@ -3465,7 +3465,7 @@ fun MovoView(
           )
           Spacer(modifier = Modifier.width(8.dp))
           Text(
-            "OPEN IN POLYMARKET",
+            "VIEW ON POLYMARKET.COM",
             fontWeight = FontWeight.ExtraBold,
             fontSize = 14.sp,
             color = Color.White,
