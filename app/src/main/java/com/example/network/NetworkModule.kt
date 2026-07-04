@@ -9,36 +9,65 @@ import retrofit2.converter.moshi.MoshiConverterFactory
 import retrofit2.http.GET
 import retrofit2.http.POST
 import retrofit2.http.Body
+import retrofit2.http.Path
 import retrofit2.http.Query
 import java.util.concurrent.TimeUnit
-import com.example.BuildConfig
-import okhttp3.Interceptor
-import okhttp3.Response
-import javax.crypto.Mac
-import javax.crypto.spec.SecretKeySpec
-import android.util.Base64
-import okio.Buffer
-import java.nio.charset.StandardCharsets
+
+/*
+ * All Polymarket surfaces used here are public, keyless, READ-ONLY endpoints.
+ * There is deliberately no order placement, no signing and no credential
+ * interceptor anywhere in this app — trading happens on polymarket.com.
+ */
 
 interface PolymarketApiService {
     @GET("events")
     suspend fun getEvents(
         @Query("limit") limit: Int = 20,
         @Query("active") active: Boolean = true,
-        @Query("closed") closed: Boolean = false
+        @Query("closed") closed: Boolean = false,
+        @Query("order") order: String? = "volume24hr",
+        @Query("ascending") ascending: Boolean? = false
     ): List<PolymarketEvent>
+
+    /** Market lookup by slug — used to resolve CLOB token ids for charts. */
+    @GET("markets")
+    suspend fun getMarketsBySlug(
+        @Query("slug") slug: String,
+        @Query("limit") limit: Int = 1
+    ): List<PolymarketMarket>
 }
+
+/** CLOB /markets returns an envelope, not a bare array. */
+data class ClobMarketsResponse(
+    val data: List<ClobMarket>? = null,
+    val next_cursor: String? = null
+)
 
 interface PolymarketClobApiService {
     @GET("markets")
     suspend fun getMarkets(
         @Query("next_cursor") nextCursor: String? = null
-    ): List<ClobMarket>
+    ): ClobMarketsResponse
 
-    @POST("order")
-    suspend fun placeOrder(
-        @Body request: ClobOrderRequest
-    ): ClobOrderResponse
+    /** Single market by 0x… condition id (public). */
+    @GET("markets/{conditionId}")
+    suspend fun getMarket(@Path("conditionId") conditionId: String): ClobMarket
+
+    /**
+     * Probability time series. `market` takes the CLOB token id (asset id).
+     * interval: 1h, 6h, 1d, 1w, 1m, max — fidelity in minutes
+     * (1w needs >= 5, 1m needs >= 10).
+     */
+    @GET("prices-history")
+    suspend fun getPriceHistory(
+        @Query("market") tokenId: String,
+        @Query("interval") interval: String = "1w",
+        @Query("fidelity") fidelityMinutes: Int = 60
+    ): PriceHistoryResponse
+
+    /** Full order book for one token id. */
+    @GET("book")
+    suspend fun getBook(@Query("token_id") tokenId: String): ClobBookResponse
 }
 
 data class ClobMarket(
@@ -55,6 +84,73 @@ data class ClobToken(
     val token_id: String,
     val outcome: String,
     val price: Double?
+)
+
+interface PolymarketDataApiService {
+    @GET("positions")
+    suspend fun getPositions(
+        @Query("user") address: String
+    ): List<DataApiPosition>
+
+    /**
+     * Recent trades for a market (0x… condition id). Pair filterType=CASH
+     * with filterAmount to get only whale-sized fills (notional >= $amount).
+     */
+    @GET("trades")
+    suspend fun getTrades(
+        @Query("market") conditionId: String,
+        @Query("limit") limit: Int = 25,
+        @Query("takerOnly") takerOnly: Boolean = true,
+        @Query("filterType") filterType: String? = null,
+        @Query("filterAmount") filterAmount: Double? = null
+    ): List<DataApiTrade>
+
+    /** Top holders per outcome token for a market. */
+    @GET("holders")
+    suspend fun getHolders(
+        @Query("market") conditionId: String,
+        @Query("limit") limit: Int = 20
+    ): List<DataApiMetaHolder>
+}
+
+data class DataApiPosition(
+    val asset: String?,
+    val conditionId: String?,
+    val size: String?,
+    val price: String?,
+    val value: String?
+)
+
+data class DataApiTrade(
+    val proxyWallet: String? = null,
+    val side: String? = null,
+    val size: Double? = null,
+    val price: Double? = null,
+    val timestamp: Long? = null, // unix seconds
+    val title: String? = null,
+    val outcome: String? = null,
+    val name: String? = null,
+    val pseudonym: String? = null,
+    val transactionHash: String? = null
+) {
+    val notionalUsd: Double get() = (size ?: 0.0) * (price ?: 0.0)
+    val traderLabel: String
+        get() = name?.takeIf { it.isNotBlank() }
+            ?: pseudonym?.takeIf { it.isNotBlank() }
+            ?: proxyWallet?.let { "${it.take(6)}…${it.takeLast(4)}" } ?: "anon"
+}
+
+data class DataApiMetaHolder(
+    val token: String? = null,
+    val holders: List<DataApiHolder>? = null
+)
+
+data class DataApiHolder(
+    val proxyWallet: String? = null,
+    val name: String? = null,
+    val pseudonym: String? = null,
+    val amount: Double? = null,
+    val outcomeIndex: Int? = null
 )
 
 interface GeminiApiService {
@@ -82,48 +178,6 @@ interface OpenAiApiService {
 }
 
 object NetworkModule {
-    class ClobAuthInterceptor : Interceptor {
-        override fun intercept(chain: Interceptor.Chain): Response {
-            val originalRequest = chain.request()
-            val timestamp = (System.currentTimeMillis() / 1000).toString()
-            val method = originalRequest.method
-            val path = originalRequest.url.encodedPath + (originalRequest.url.encodedQuery?.let { "?$it" } ?: "")
-            
-            var bodyString = ""
-            originalRequest.body?.let { requestBody ->
-                val buffer = Buffer()
-                requestBody.writeTo(buffer)
-                bodyString = buffer.readString(StandardCharsets.UTF_8)
-            }
-
-            val message = timestamp + method + path + bodyString
-            
-            // Generate HMAC SHA256 Signature
-            val secret = BuildConfig.POLYMARKET_API_SECRET
-            val signature = try {
-                if (secret.isNotBlank() && secret != "MY_POLYMARKET_API_SECRET") {
-                    val secretDecoded = Base64.decode(secret, Base64.NO_WRAP)
-                    val mac = Mac.getInstance("HmacSHA256")
-                    mac.init(SecretKeySpec(secretDecoded, "HmacSHA256"))
-                    val hash = mac.doFinal(message.toByteArray(StandardCharsets.UTF_8))
-                    Base64.encodeToString(hash, Base64.NO_WRAP)
-                } else ""
-            } catch (e: Exception) {
-                ""
-            }
-
-            val newRequest = originalRequest.newBuilder()
-                .header("POLY_API_KEY", BuildConfig.POLYMARKET_API_KEY)
-                .header("POLY_PASSPHRASE", BuildConfig.POLYMARKET_API_PASSPHRASE)
-                .header("POLY_TIMESTAMP", timestamp)
-                .header("POLY_SIGNATURE", signature)
-                .header("POLY_ADDRESS", BuildConfig.POLYMARKET_ADDRESS)
-                .build()
-
-            return chain.proceed(newRequest)
-        }
-    }
-
     private val moshi = Moshi.Builder()
         .add(KotlinJsonAdapterFactory())
         .build()
@@ -132,7 +186,7 @@ object NetworkModule {
         .connectTimeout(60, TimeUnit.SECONDS)
         .readTimeout(60, TimeUnit.SECONDS)
         .addInterceptor(HttpLoggingInterceptor().apply {
-            level = HttpLoggingInterceptor.Level.BODY
+            level = HttpLoggingInterceptor.Level.BASIC
         })
         .build()
 
@@ -145,17 +199,22 @@ object NetworkModule {
             .create(PolymarketApiService::class.java)
     }
 
-    private val clobOkHttpClient = okHttpClient.newBuilder()
-        .addInterceptor(ClobAuthInterceptor())
-        .build()
-
     val polymarketClobApi: PolymarketClobApiService by lazy {
         Retrofit.Builder()
             .baseUrl("https://clob.polymarket.com/")
-            .client(clobOkHttpClient)
+            .client(okHttpClient)
             .addConverterFactory(MoshiConverterFactory.create(moshi))
             .build()
             .create(PolymarketClobApiService::class.java)
+    }
+
+    val polymarketDataApi: PolymarketDataApiService by lazy {
+        Retrofit.Builder()
+            .baseUrl("https://data-api.polymarket.com/")
+            .client(okHttpClient)
+            .addConverterFactory(MoshiConverterFactory.create(moshi))
+            .build()
+            .create(PolymarketDataApiService::class.java)
     }
 
     val geminiApi: GeminiApiService by lazy {

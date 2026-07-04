@@ -1,0 +1,67 @@
+name: Build & Publish Android APK
+
+# Builds ONE universal, installable APK signed with the committed sideload
+# keystore and publishes it to a GitHub Release so the permanent link
+#   https://github.com/charlesbilsky-netizen/poly-market-trader/releases/latest/download/PolyTrader.apk
+# (the URL baked into the in-app QR code) always serves the newest build.
+
+on:
+  push:
+    branches: [main, "claude/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.14.3"
+
+      - name: Build universal release APK
+        run: gradle assembleRelease --no-daemon
+
+      - name: Verify APK signature
+        run: |
+          APK=app/build/outputs/apk/release/app-release.apk
+          ls -la "$APK"
+          # Runners ship several build-tools versions — pick the newest one.
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          "$BT/apksigner" verify --print-certs "$APK"
+
+      - name: Rename artifact
+        run: cp app/build/outputs/apk/release/app-release.apk PolyTrader.apk
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PolyTrader-apk
+          path: PolyTrader.apk
+
+      - name: Publish / refresh the "android-latest" release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: android-latest
+          name: "PolyTrader — latest Android build"
+          body: |
+            Universal APK (all ABIs, one file) signed with the project sideload key.
+
+            **Install on Android:** download `PolyTrader.apk` below, open it,
+            and confirm the install prompts. If the browser warns about APK
+            files, choose "Download anyway"; if Play Protect asks, tap
+            "More details → Install anyway".
+          files: PolyTrader.apk
+          make_latest: true
